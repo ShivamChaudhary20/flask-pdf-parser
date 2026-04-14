@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EOB History - Parsed Records</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="container">
+
+    <div class="top-bar">
+        <span class="patient-info">&#128203; EOB Parse History</span>
+        <div class="tabs">
+            <a href="/" class="tab" style="text-decoration:none;color:inherit;">&#8592; Back to Form</a>
+        </div>
+    </div>
+
+    <!-- Search -->
+    <div class="history-toolbar">
+        <input type="text" id="searchInput" class="history-search"
+               placeholder="Search by patient, claim #, member ID, or filename...">
+        <span class="record-count" id="recordCount"></span>
+    </div>
+
+    <!-- Records Table -->
+    <div class="table-wrapper" style="margin:0 16px 16px;">
+        <table class="service-table history-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Date</th>
+                    <th>Patient Name</th>
+                    <th>Claim #</th>
+                    <th>Member ID</th>
+                    <th>Total Payable</th>
+                    <th>Lines</th>
+                    <th>OCR</th>
+                    <th>Filename</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="historyBody">
+                <tr><td colspan="10" style="text-align:center;padding:30px;color:#999;">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    <div class="pagination" id="pagination"></div>
+
+    <!-- Detail Modal -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modalTitle">Record Details</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody"></div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+let currentPage = 1;
+let searchTimeout = null;
+
+document.getElementById('searchInput').addEventListener('input', (e) => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => {
+        currentPage = 1;
+        loadRecords();
+    }, 300);
+});
+
+function loadRecords() {
+    const search = document.getElementById('searchInput').value;
+    const url = `/api/records?page=${currentPage}&per_page=15&search=${encodeURIComponent(search)}`;
+
+    fetch(url).then(r => r.json()).then(data => {
+        renderTable(data.records);
+        renderPagination(data.page, data.pages, data.total);
+        document.getElementById('recordCount').textContent = `${data.total} record${data.total !== 1 ? 's' : ''}`;
+    });
+}
+
+function renderTable(records) {
+    const tbody = document.getElementById('historyBody');
+    if (!records.length) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:30px;color:#999;">No records found</td></tr>';
+        return;
+    }
+    tbody.innerHTML = records.map(r => `
+        <tr>
+            <td>${r.id}</td>
+            <td>${formatDate(r.created_at)}</td>
+            <td><strong>${esc(r.patient_name) || '-'}</strong></td>
+            <td>${esc(r.claim_number) || '-'}</td>
+            <td>${esc(r.member_id) || '-'}</td>
+            <td>${r.total_payable_to_provider ? '$' + r.total_payable_to_provider : '-'}</td>
+            <td>${r.service_lines.length}</td>
+            <td>${r.used_ocr ? '<span class="badge badge-ocr">OCR</span>' : '<span class="badge badge-text">Text</span>'}</td>
+            <td class="filename-cell" title="${esc(r.filename)}">${esc(r.filename)}</td>
+            <td>
+                <button class="btn-sm btn-view" onclick="viewRecord(${r.id})">View</button>
+                <button class="btn-sm btn-load" onclick="loadToForm(${r.id})">Load</button>
+                <button class="btn-sm btn-delete" onclick="deleteRecord(${r.id})">Delete</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function renderPagination(page, pages, total) {
+    const div = document.getElementById('pagination');
+    if (pages <= 1) { div.innerHTML = ''; return; }
+    let html = '';
+    for (let i = 1; i <= pages; i++) {
+        html += `<button class="page-btn ${i === page ? 'active' : ''}" onclick="goToPage(${i})">${i}</button>`;
+    }
+    div.innerHTML = html;
+}
+
+function goToPage(p) {
+    currentPage = p;
+    loadRecords();
+}
+
+function viewRecord(id) {
+    fetch(`/api/records/${id}`).then(r => r.json()).then(r => {
+        document.getElementById('modalTitle').textContent = `Record #${r.id} — ${r.patient_name || 'Unknown'}`;
+        let html = '<div class="detail-grid">';
+        const fields = [
+            ['Patient', r.patient_name], ['Claim #', r.claim_number],
+            ['Member ID', r.member_id], ['Subscriber ID', r.subscriber_id],
+            ['Subscriber Name', r.subscriber_name], ['Date Received', r.date_received],
+            ['PCP #', r.pcp_number], ['PCP Name', r.pcp_name],
+            ['Billing NPI', r.billing_npi], ['Servicing NPI', r.servicing_prov_npi],
+            ['Servicing Prov', r.servicing_prov_nm], ['Carrier ID', r.carrier_id],
+            ['Patient Account', r.patient_account], ['Product', r.product_desc],
+            ['Remit Detail', r.remit_detail], ['Interest', r.interest_amount],
+            ['Total Payable', r.total_payable_to_provider],
+        ];
+        fields.forEach(([label, val]) => {
+            html += `<div class="detail-item"><span class="detail-label">${label}</span><span class="detail-value">${esc(val) || '-'}</span></div>`;
+        });
+        html += '</div>';
+
+        if (r.service_lines.length) {
+            html += '<h4 style="margin:16px 0 8px;">Service Lines</h4><div class="table-wrapper"><table class="service-table"><thead><tr>';
+            html += '<th>#</th><th>Date</th><th>Desc</th><th>Units</th><th>Billed</th><th>Disallow</th><th>Allowed</th><th>Deduct</th><th>Copay</th><th>COB</th><th>Withhold</th><th>Paid</th><th>Pt Resp</th>';
+            html += '</tr></thead><tbody>';
+            r.service_lines.forEach((sl, i) => {
+                html += `<tr><td>${i+1}</td><td>${sl.date_of_service}</td><td>${esc(sl.description)}</td><td>${sl.units}</td>`;
+                html += `<td>${sl.billed_amt}</td><td>${sl.disallow_amt}</td><td>${sl.allowed_amt}</td><td>${sl.deduct_amt}</td>`;
+                html += `<td>${sl.copay_coins_amt}</td><td>${sl.cob_pmt_amt}</td><td>${sl.withhold_amt}</td><td>${sl.paid_to_provider_amt}</td><td>${sl.patient_resp_amt}</td></tr>`;
+            });
+            html += '</tbody></table></div>';
+        }
+
+        document.getElementById('modalBody').innerHTML = html;
+        document.getElementById('modalOverlay').classList.add('show');
+    });
+}
+
+function closeModal() {
+    document.getElementById('modalOverlay').classList.remove('show');
+}
+
+function loadToForm(id) {
+    // Navigate to main form with this record's data pre-loaded
+    window.location.href = `/?record=${id}`;
+}
+
+function deleteRecord(id) {
+    if (!confirm('Delete this record permanently?')) return;
+    fetch(`/api/records/${id}`, { method: 'DELETE' })
+        .then(r => r.json())
+        .then(() => loadRecords());
+}
+
+function formatDate(iso) {
+    if (!iso) return '-';
+    const d = new Date(iso);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function esc(str) {
+    if (!str) return '';
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
+
+document.getElementById('modalOverlay').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeModal();
+});
+
+loadRecords();
+</script>
+
+</body>
+</html>

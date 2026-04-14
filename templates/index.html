@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Medical Billing - Auto Fill from EOB PDF</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="container">
+
+    <!-- ===== Top Bar ===== -->
+    <div class="top-bar">
+        <span class="patient-info" id="topPatientInfo">PATIENT: --</span>
+        <a href="/history" class="history-link">&#128203; History</a>
+    </div>
+
+    <!-- ===== PDF Upload ===== -->
+    <div class="upload-section" id="uploadArea">
+        <div class="upload-icon">&#128196;</div>
+        <div class="upload-text">
+            <h3>Upload EOB / Remittance PDF</h3>
+            <p>Drag &amp; drop or click to browse. The form will auto-fill from the PDF data.</p>
+        </div>
+        <label class="upload-btn" for="pdfInput">Choose PDF</label>
+        <input type="file" id="pdfInput" accept=".pdf">
+        <div class="upload-status" id="uploadStatus"></div>
+    </div>
+
+    <!-- ===== Main Form ===== -->
+    <form id="billingForm" class="form-body" autocomplete="off">
+
+        <!-- Patient & Claim Info -->
+        <div class="form-grid">
+            <div class="section-header"><span class="icon">&#128100;</span> Patient &amp; Claim Information</div>
+
+            <div class="form-group span-2">
+                <label>Patient Name <span class="required">*</span></label>
+                <input type="text" id="patientName" name="patient_name" placeholder="Patient full name">
+            </div>
+            <div class="form-group">
+                <label>Claim Number <span class="required">*</span></label>
+                <input type="text" id="claimNumber" name="claim_number" placeholder="e.g. RC0030069700">
+            </div>
+            <div class="form-group">
+                <label>Patient Account</label>
+                <input type="text" id="patientAccount" name="patient_account">
+            </div>
+
+            <div class="form-group">
+                <label>Subscriber ID</label>
+                <input type="text" id="subscriberId" name="subscriber_id">
+            </div>
+            <div class="form-group">
+                <label>Member ID</label>
+                <input type="text" id="memberId" name="member_id">
+            </div>
+            <div class="form-group">
+                <label>Subscriber Name</label>
+                <input type="text" id="subscriberName" name="subscriber_name">
+            </div>
+            <div class="form-group">
+                <label>Date Received</label>
+                <input type="text" id="dateReceived" name="date_received" placeholder="MM/DD/YY">
+            </div>
+
+            <div class="form-group">
+                <label>PCP Number</label>
+                <input type="text" id="pcpNumber" name="pcp_number">
+            </div>
+            <div class="form-group">
+                <label>PCP Name</label>
+                <input type="text" id="pcpName" name="pcp_name">
+            </div>
+            <div class="form-group">
+                <label>Remit Detail</label>
+                <input type="text" id="remitDetail" name="remit_detail">
+            </div>
+            <div class="form-group">
+                <label>Product Description</label>
+                <input type="text" id="productDesc" name="product_desc">
+            </div>
+        </div>
+
+        <!-- Provider & Billing -->
+        <div class="form-grid">
+            <div class="section-header"><span class="icon">&#127973;</span> Provider &amp; Billing</div>
+
+            <div class="form-group">
+                <label>Servicing Provider Name</label>
+                <input type="text" id="servicingProvNm" name="servicing_prov_nm">
+            </div>
+            <div class="form-group">
+                <label>Servicing Prov NPI</label>
+                <input type="text" id="servicingProvNpi" name="servicing_prov_npi">
+            </div>
+            <div class="form-group">
+                <label>Billing NPI</label>
+                <input type="text" id="billingNpi" name="billing_npi">
+            </div>
+            <div class="form-group">
+                <label>Carrier</label>
+                <input type="text" id="carrierId" name="carrier_id">
+            </div>
+            <div class="form-group">
+                <label>Interest Amount</label>
+                <input type="text" id="interestAmount" name="interest_amount">
+            </div>
+        </div>
+
+        <!-- Payment Info -->
+        <div class="form-grid">
+            <div class="section-header"><span class="icon">&#128179;</span> Payment Information</div>
+
+            <div class="form-group">
+                <label>Payment Code <span class="required">*</span></label>
+                <select id="paymentCode" name="payment_code">
+                    <option value="">-- Select --</option>
+                    <option value="PP">PP - Patient Payment</option>
+                    <option value="IP">IP - Insurance Payment</option>
+                    <option value="ADJ">ADJ - Adjustment</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Payment Amount <span class="required">*</span></label>
+                <input type="text" id="paymentAmount" name="payment_amount" placeholder="0.00">
+            </div>
+            <div class="form-group">
+                <label>Copay</label>
+                <input type="text" id="copayAmount" name="copay_amount" placeholder="0.00">
+            </div>
+            <div class="form-group">
+                <label>Patient Balance</label>
+                <input type="text" id="patientBalance" name="patient_balance" placeholder="0.00">
+            </div>
+
+            <div class="form-group">
+                <label>Payment Method <span class="required">*</span></label>
+                <select id="paymentMethod" name="payment_method">
+                    <option value="">-- Select --</option>
+                    <option value="credit_card">Credit Card Not Present</option>
+                    <option value="check">Check</option>
+                    <option value="eft">EFT</option>
+                    <option value="cash">Cash</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Authorization #</label>
+                <input type="text" id="authorizationNum" name="authorization_num">
+            </div>
+            <div class="form-group">
+                <label>Disbursal Method</label>
+                <select id="disbursalMethod" name="disbursal_method">
+                    <option value="manual">Manual</option>
+                    <option value="auto">Auto</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Deposit Date <span class="required">*</span></label>
+                <input type="date" id="depositDate" name="deposit_date">
+            </div>
+
+            <div class="form-group">
+                <label>Total Payable to Provider</label>
+                <input type="text" id="totalPayable" name="total_payable" placeholder="0.00">
+            </div>
+        </div>
+
+        <!-- Payment Note -->
+        <div class="note-section" style="padding: 0 0 10px;">
+            <div class="form-group">
+                <label>Payment Note</label>
+                <textarea id="paymentNote" name="payment_note" rows="2" placeholder="Add notes here..."></textarea>
+            </div>
+        </div>
+
+        <!-- ===== Service Lines Table ===== -->
+        <div class="table-wrapper">
+            <table class="service-table" id="serviceTable">
+                <thead>
+                    <tr>
+                        <th style="width:40px">#</th>
+                        <th>Date of Service</th>
+                        <th>Description / Code</th>
+                        <th>Units</th>
+                        <th>Billed Amt</th>
+                        <th>Disallow Amt</th>
+                        <th>Allowed Amt</th>
+                        <th>Deduct Amt</th>
+                        <th>Copay/Coins</th>
+                        <th>COB Pmt Amt</th>
+                        <th>Withhold Amt</th>
+                        <th>Paid to Provider</th>
+                        <th>Patient Resp</th>
+                    </tr>
+                </thead>
+                <tbody id="serviceBody">
+                    <!-- Dynamic rows will be inserted here -->
+                    <tr class="empty-row">
+                        <td colspan="13" style="text-align:center; color:#999; padding:20px;">
+                            Upload a PDF to auto-fill service line details
+                        </td>
+                    </tr>
+                </tbody>
+                <tfoot>
+                    <tr class="totals-row">
+                        <td colspan="4" style="text-align:right; font-weight:700;">TOTALS:</td>
+                        <td><input type="text" id="totalBilled" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalDisallow" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalAllowed" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalDeduct" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalCopay" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalCob" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalWithhold" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalPaidProvider" readonly style="font-weight:700;background:#eef4fb;"></td>
+                        <td><input type="text" id="totalPatientResp" readonly style="font-weight:700;background:#eef4fb;"></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+    </form>
+
+    <!-- ===== Footer ===== -->
+    <div class="form-footer">
+        <div class="left">
+            <label>Receipt Method:
+                <select style="font-size:12px;padding:3px;">
+                    <option>Email</option>
+                    <option>Print</option>
+                </select>
+            </label>
+            <label>Printed Receipt:
+                <select style="font-size:12px;padding:3px;">
+                    <option>Basic Patient Receipt</option>
+                </select>
+            </label>
+            <label>Email: <input type="email" id="emailField" style="font-size:12px;padding:3px;width:200px;" placeholder="patient@email.com"></label>
+        </div>
+        <div class="right">
+            <button type="button" class="btn" onclick="clearForm()">Clear</button>
+            <button type="button" class="btn btn-primary" onclick="submitForm()">Submit</button>
+        </div>
+    </div>
+
+</div>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
