@@ -332,18 +332,55 @@ def _clean_amount(val):
     return cleaned
 
 
+def _new_data_record():
+    """Create a fresh parsed-record payload with default values."""
+    return {
+        "patient_name": "",
+        "subscriber_id": "",
+        "member_id": "",
+        "servicing_prov_npi": "",
+        "subscriber_name": "",                                                                  
+        "interest_amount": "",
+        "servicing_prov_nm": "",
+        "date_received": "",
+        "pcp_number": "",
+        "claim_number": "",
+        "remit_detail": "",
+        "pcp_name": "",
+        "patient_account": "",
+        "product_desc": "",
+        "billing_npi": "",
+        "carrier_id": "",
+        "carrier_name": "",
+        "payment_number": "",
+        "payment_date": "",
+        "total_payable_to_provider": "",
+        "service_lines": [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # OCR fallback for scanned / image-based PDFs
 # ---------------------------------------------------------------------------
 
-def _ocr_pdf(pdf_path):
-    """Convert PDF to images and run OCR on each page."""
+def _ocr_pdf(pdf_path, max_pages=5, timeout_per_page=15):
+    """Convert PDF to images and run OCR on each page.
+
+    Uses a per-page timeout and page limit to avoid hanging on large
+    scanned documents.  DPI kept at 150 for speed; sufficient for
+    typical EOB/remittance text.
+    """
     try:
-        images = convert_from_path(pdf_path, dpi=300)
+        images = convert_from_path(pdf_path, dpi=150, first_page=1,
+                                   last_page=max_pages)
         pages_text = []
         for img in images:
-            text = pytesseract.image_to_string(img)
-            pages_text.append(text)
+            try:
+                text = pytesseract.image_to_string(img, timeout=timeout_per_page)
+                pages_text.append(text)
+            except RuntimeError:
+                # Timeout on this page — skip it
+                pages_text.append("")
         return "\n".join(pages_text)
     except Exception:
         return ""
@@ -371,58 +408,45 @@ def extract_eob_data(pdf_path):
     used_ocr = False
     if len(text_stripped) < 50:
         if OCR_AVAILABLE:
-            full_text = _ocr_pdf(pdf_path)
-            used_ocr = bool(full_text.strip())
-            # OCR doesn't produce structured tables, so tables stays empty
+            ocr_text = _ocr_pdf(pdf_path)
+            if ocr_text.strip():
+                full_text = ocr_text
+                used_ocr = True
+            else:
+                # OCR ran but extracted nothing useful
+                data = _new_data_record()
+                data["_notice"] = (
+                    "This PDF is an image/scanned document. "
+                    "OCR could not extract readable text. "
+                    "Please try a higher-quality scan."
+                )
+                return data
         else:
-            # Can't extract — return empty data with a notice
-            return {
-                "patient_name": "", "subscriber_id": "", "member_id": "",
-                "servicing_prov_npi": "", "subscriber_name": "",
-                "interest_amount": "", "servicing_prov_nm": "",
-                "date_received": "", "pcp_number": "", "claim_number": "",
-                "remit_detail": "", "pcp_name": "", "patient_account": "",
-                "product_desc": "", "billing_npi": "", "carrier_id": "",
-                "carrier_name": "", "payment_number": "", "payment_date": "",
-                "total_payable_to_provider": "", "service_lines": [],
-                "_notice": "This PDF is an image/scanned document. OCR engine is not installed. Please install tesseract to enable OCR.",
-            }
+            data = _new_data_record()
+            data["_notice"] = (
+                "This PDF is an image/scanned document. "
+                "Install tesseract to enable OCR extraction."
+            )
+            return data
 
-    data = {
-        "patient_name": "",
-        "subscriber_id": "",
-        "member_id": "",
-        "servicing_prov_npi": "",
-        "subscriber_name": "",
-        "interest_amount": "",
-        "servicing_prov_nm": "",
-        "date_received": "",
-        "pcp_number": "",
-        "claim_number": "",
-        "remit_detail": "",
-        "pcp_name": "",
-        "patient_account": "",
-        "product_desc": "",
-        "billing_npi": "",
-        "carrier_id": "",
-        "carrier_name": "",
-        "payment_number": "",
-        "payment_date": "",
-        "total_payable_to_provider": "",
-        "service_lines": [],
-    }
+    data = _new_data_record()
 
     # ---- 1. Extract header fields using multi-pattern matching ----
     lines = full_text.split("\n")
+    remaining_fields = set(FIELD_PATTERNS.keys())
     for line in lines:
-        for field, patterns in FIELD_PATTERNS.items():
-            if data[field]:  # already found
-                continue
-            for pattern in patterns:
+        if not remaining_fields:
+            break  # all fields found — stop scanning
+        matched_in_line = []
+        for field in remaining_fields:
+            for pattern in FIELD_PATTERNS[field]:
                 m = re.search(pattern, line, re.IGNORECASE)
                 if m:
                     data[field] = m.group(1).strip()
+                    matched_in_line.append(field)
                     break
+        for f in matched_in_line:
+            remaining_fields.discard(f)
 
     # ---- 2. Extract service lines from tables (smart column mapping) ----
     _extract_service_lines_from_tables(tables, data)
@@ -443,21 +467,72 @@ def extract_eob_data(pdf_path):
     if not data["service_lines"]:
         _extract_amounts_from_text(full_text, data)
 
-    # ---- 7. Extract carrier name from first line if still empty ----
+    # ---- 7. Extract carrier name from text if still empty ----
     if not data["carrier_name"]:
-        for line in lines[:5]:
+        carrier_re = re.compile(
+            r"(?:insurance|healthcare|health\s*plan|behavioral\s*health|"
+            r"blue\s*cross|blue\s*shield|bcbs|"
+            r"aetna|cigna|humana|united\s*health|anthem|kaiser|molina|centene|"
+            r"wellcare|ambetter|medicaid|medicare|tricare|"
+            r"carelon|optum|magellan|beacon|"
+            r"wellpoint|highmark|carefirst|premera|regence|"
+            r"providence\s+health|medical\s*mutual)",
+            re.IGNORECASE
+        )
+        # Check first few lines (common header location)
+        for line in lines[:10]:
             stripped = line.strip()
-            if stripped and re.search(
-                r"(?:insurance|healthcare|health\s*plan|blue\s*cross|blue\s*shield|"
-                r"aetna|cigna|humana|united|anthem|kaiser|molina|centene|"
-                r"wellcare|ambetter|medicaid|medicare|tricare)",
-                stripped, re.IGNORECASE
-            ):
+            if stripped and carrier_re.search(stripped):
+                # Skip nav/breadcrumb lines and label-prefixed lines
+                if ">" in stripped and "home" in stripped.lower():
+                    continue
+                if re.match(r"^(plan\s*name|product\s*desc)", stripped, re.IGNORECASE):
+                    continue
                 data["carrier_name"] = stripped
                 break
+        # If still not found, scan whole document
+        if not data["carrier_name"]:
+            for line in lines:
+                stripped = line.strip()
+                if stripped and carrier_re.search(stripped) and len(stripped) < 80:
+                    if ">" in stripped and "home" in stripped.lower():
+                        continue
+                    if re.match(r"^(plan\s*name|product\s*desc)", stripped, re.IGNORECASE):
+                        continue
+                    data["carrier_name"] = stripped
+                    break
+
+        # Clean up OCR-garbled carrier names using known mappings
+        if data["carrier_name"]:
+            _CARRIER_CLEAN = {
+                "carelon": "Carelon Behavioral Health",
+                "united": "UnitedHealthcare",
+                "unitedhealth": "UnitedHealthcare",
+                "aetna": "Aetna",
+                "cigna": "Cigna",
+                "anthem": "Anthem",
+                "humana": "Humana",
+                "kaiser": "Kaiser Permanente",
+                "molina": "Molina Healthcare",
+                "bcbs": "Blue Cross Blue Shield",
+                "blue cross": "Blue Cross Blue Shield",
+                "optum": "Optum",
+                "magellan": "Magellan Health",
+                "beacon": "Beacon Health",
+            }
+            for keyword, clean_name in _CARRIER_CLEAN.items():
+                if keyword in data["carrier_name"].lower():
+                    data["carrier_name"] = clean_name
+                    break
 
     # ---- 8. Compute missing fields from what we have ----
     _compute_derived_fields(data)
+
+    # ---- 9. Build multi-record output for Medicare multi-patient PDFs ----
+    multi_records = _extract_medicare_records(full_text, lines, data)
+    if len(multi_records) > 1:
+        data["_records"] = multi_records
+
     # ---- 8. Add processing notice ----
     if used_ocr:
         data["_notice"] = "This PDF is an image/scanned document. Data was extracted using OCR — please verify accuracy."
@@ -637,12 +712,14 @@ def _extract_medicare_claims(full_text, lines, data):
     # --- Detect Medicare format ---
     is_medicare = bool(
         re.search(r"MEDICARE\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE)
-        or re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV\s+PD", full_text)
+        or re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV[_ ]PD", full_text)
+        or (re.search(r"\bMEDICARE\b", full_text, re.IGNORECASE)
+            and re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text))
     )
     if not is_medicare:
         return
 
-    # --- Extract header info (NPI, DATE, CHECK/EFT) ---
+    # --- Extract header info (NPI, DATE, CHECK/EFT, carrier) ---
     for line in lines:
         if not data["billing_npi"]:
             m = re.search(r"\bNPI:\s*([\d]+)", line)
@@ -652,6 +729,14 @@ def _extract_medicare_claims(full_text, lines, data):
             m = re.search(r"\bDATE:\s*([\d/]+)", line)
             if m:
                 data["date_received"] = m.group(1)
+        if not data["payment_number"]:
+            m = re.search(r"CHECK/EFT\s*#?:?\s*([\d]+)", line)
+            if m:
+                data["payment_number"] = m.group(1)
+        if not data["payment_date"]:
+            m = re.search(r"\bDATE:\s*([\d/]+)", line)
+            if m:
+                data["payment_date"] = m.group(1)
 
     # --- Find claim blocks (each starts with "NAME ...") ---
     claim_blocks = []
@@ -703,6 +788,77 @@ def _extract_medicare_claims(full_text, lines, data):
         total = sum(float(sl["paid_to_provider_amt"]) for sl in data["service_lines"])
         if total > 0:
             data["total_payable_to_provider"] = f"{total:.2f}"
+
+
+def _extract_medicare_records(full_text, lines, base_data):
+    """Return one parsed record per Medicare claim block, if applicable."""
+    is_medicare = bool(
+        re.search(r"MEDICARE\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE)
+        or re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV[_ ]PD", full_text)
+        or (re.search(r"\bMEDICARE\b", full_text, re.IGNORECASE)
+            and re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text))
+    )
+    if not is_medicare:
+        return [base_data]
+
+    # Split into claim blocks starting with NAME ... MID ... ACNT ... ICN
+    claim_blocks = []
+    current_block = []
+    for line in lines:
+        if re.match(r"\s*NAME\s+[A-Z]", line, re.IGNORECASE):
+            if current_block:
+                claim_blocks.append(current_block)
+            current_block = [line]
+        elif current_block:
+            current_block.append(line)
+    if current_block:
+        claim_blocks.append(current_block)
+
+    if len(claim_blocks) <= 1:
+        return [base_data]
+
+    records = []
+    for block in claim_blocks:
+        block_text = " ".join(block)
+        rec = _new_data_record()
+
+        # Copy shared payment/provider context from parsed base data.
+        for key in (
+            "date_received", "payment_date", "payment_number",
+            "billing_npi", "servicing_prov_npi", "servicing_prov_nm",
+            "carrier_name", "carrier_id", "product_desc", "remit_detail",
+            "interest_amount", "pcp_number", "pcp_name",
+        ):
+            rec[key] = base_data.get(key, "")
+
+        m_name = re.search(r"\bNAME\s+([A-Z][A-Za-z,. \-]+?)\s+MID\b", block_text)
+        if not m_name:
+            m_name = re.search(r"\bNAME\s+([A-Z][A-Za-z,. \-]+?)\s{2,}MID\b", block_text)
+        if m_name:
+            rec["patient_name"] = m_name.group(1).strip()
+            rec["subscriber_name"] = rec["patient_name"]
+
+        m_mid = re.search(r"\bMID\s+([\w]+)", block_text)
+        if m_mid:
+            rec["member_id"] = m_mid.group(1)
+
+        m_acnt = re.search(r"\bACNT\s+([\w]+)", block_text)
+        if m_acnt:
+            rec["patient_account"] = m_acnt.group(1)
+
+        m_icn = re.search(r"\bICN\s+(\d{10,})", block_text)
+        if m_icn:
+            rec["claim_number"] = m_icn.group(1)
+
+        # Reuse existing Medicare service-line parser for this block.
+        _parse_medicare_block(block, rec)
+        _compute_derived_fields(rec)
+
+        # Keep only blocks that produced a patient or claim signal.
+        if rec["patient_name"] or rec["claim_number"] or rec["service_lines"]:
+            records.append(rec)
+
+    return records if records else [base_data]
 
 
 def _parse_medicare_block(block_lines, data):
@@ -910,29 +1066,68 @@ def _extract_ocr_service_lines(lines, data):
 
 
 def _extract_amounts_from_text(text, data):
-    """Fallback: extract individual amounts from raw text."""
-    patterns = {
-        "billed_amt": r"(?:BILLED|CHARGE)\s*(?:AMT|AMOUNT)?\s*(?:\(\$?\))?\s*\$?([\d,.]+)",
-        "disallow_amt": r"DISALLOW(?:ED)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "allowed_amt": r"ALLOWED\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "deduct_amt": r"DEDUCT(?:IBLE)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "copay_coins_amt": r"CO(?:PAY|IN)/?(?:COINS?|PAY)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "cob_pmt_amt": r"COB\s*(?:PMT|PAYMENT)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "withhold_amt": r"WITHHOLD\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "paid_to_provider_amt": r"(?:PAID\s*TO\s*PROVIDER|AMT\s*PAID|AMOUNT\s*PAID|NET\s*PAID)\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-        "patient_resp_amt": r"PATIENT\s*RESP(?:ONSIBILITY)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)",
-    }
+    """Fallback: extract individual amounts from raw text.
+
+    Works on both single-line and multi-line OCR output where the label
+    and amount may be separated by newlines/whitespace.
+    """
+    # Collapse newlines to spaces so label + amount on adjacent lines still match.
+    collapsed = re.sub(r"\s*\n\s*", " ", text)
+
+    # Order matters: extract specific labeled amounts first, then fallbacks.
+    # Use ordered list so billed is matched before paid (prevents column-shift
+    # mismatches in OCR where "Charge Amt ($) ... Amt Paid ($) 225.00" appears
+    # with the number belonging to the charge, not the paid column).
+    ordered_patterns = [
+        ("billed_amt",            r"(?:BILLED|CHARGE)\s*(?:AMT|AMOUNT)?\s*(?:\(?\$?\)?)?\s*(?:[\S\s]{0,30}?)([\d]+\.\d{2})"),
+        ("allowed_amt",           r"ALLOWED\s*(?:AMT|AMOUNT)?[\s\S]{0,80}?([\d]+\.\d{2})"),
+        ("deduct_amt",            r"DEDUCT(?:IBLE)?\s*(?:AMT|AMOUNT)?[\s\S]{0,80}?([\d]+\.\d{2})"),
+        ("copay_coins_amt",       r"CO(?:PAY|IN)/?(?:COINS?|PAY)?\s*(?:AMT|AMOUNT)?[\s\S]{0,30}?([\d]+\.\d{2})"),
+        ("disallow_amt",          r"DISALLOW(?:ED)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)"),
+        ("cob_pmt_amt",           r"COB\s*(?:PMT|PAYMENT)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)"),
+        ("withhold_amt",          r"WITHHOLD\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)"),
+        ("paid_to_provider_amt",  r"(?:PAID\s*TO\s*PROVIDER|NET\s*PAID)\s*(?:AMT|AMOUNT)?\s*(?:\(?\$?\)?)?\s*\$?([\d]+\.\d{2})"),
+        ("paid_to_provider_amt",  r"AMT\s*PAID\s*(?:\(?\$?\)?)?\s*\$?([\d]+\.\d{2})"),
+        ("patient_resp_amt",      r"PATIENT\s*RESP(?:ONSIBILITY)?\s*(?:AMT|AMOUNT)?\s*\$?([\d,.]+)"),
+    ]
 
     service_line = {}
-    for key, pattern in patterns.items():
-        m = re.search(pattern, text, re.IGNORECASE)
+    matched_positions = {}  # Track where each match was found
+    for key, pattern in ordered_patterns:
+        if key in service_line:
+            continue  # already found
+        m = re.search(pattern, collapsed, re.IGNORECASE)
         if m:
-            service_line[key] = _clean_amount(m.group(1))
+            val = _clean_amount(m.group(1))
+            pos = m.start(1)
+            # If this amount was already claimed by a prior field at the same
+            # position, skip it (avoids OCR column-merge double-counting).
+            if any(abs(pos - p) < 5 for p in matched_positions.values()):
+                continue
+            service_line[key] = val
+            matched_positions[key] = pos
+
+    # If allowed > 0 but no explicit paid-to-provider, use allowed as paid
+    if service_line.get("allowed_amt") and service_line.get("allowed_amt") != "0.00":
+        if not service_line.get("paid_to_provider_amt") or service_line["paid_to_provider_amt"] == "0.00":
+            service_line["paid_to_provider_amt"] = service_line["allowed_amt"]
+
+    # Also try to grab service date from the text
+    date_match = re.search(
+        r"(?:SERVICE\s+DATE|SERV(?:ICE)?\s+DATE)S?\s*:?\s*(\d{2}/\d{2}/\d{2,4})",
+        collapsed, re.IGNORECASE
+    )
 
     if service_line:
-        for key in patterns:
+        all_keys = {k for k, _ in ordered_patterns}
+        for key in all_keys:
             service_line.setdefault(key, "0.00")
-        service_line.setdefault("date_of_service", "")
+        service_line.setdefault("date_of_service",
+                                date_match.group(1) if date_match else "")
         service_line.setdefault("description", "")
         service_line.setdefault("units", "1")
         data["service_lines"].append(service_line)
+
+        # Also fill total_payable if we found paid amount
+        if not data["total_payable_to_provider"] and service_line.get("paid_to_provider_amt", "0.00") != "0.00":
+            data["total_payable_to_provider"] = service_line["paid_to_provider_amt"]

@@ -54,52 +54,164 @@ def upload_pdf():
     try:
         data = extract_eob_data(filepath)
 
-        # Save to database
-        used_ocr = bool(data.get("_notice"))
-        record = EOBRecord(
-            filename=filename,
-            used_ocr=used_ocr,
-            patient_name=data.get("patient_name", ""),
-            subscriber_id=data.get("subscriber_id", ""),
-            member_id=data.get("member_id", ""),
-            subscriber_name=data.get("subscriber_name", ""),
-            date_received=data.get("date_received", ""),
-            pcp_number=data.get("pcp_number", ""),
-            pcp_name=data.get("pcp_name", ""),
-            claim_number=data.get("claim_number", ""),
-            remit_detail=data.get("remit_detail", ""),
-            patient_account=data.get("patient_account", ""),
-            product_desc=data.get("product_desc", ""),
-            servicing_prov_npi=data.get("servicing_prov_npi", ""),
-            servicing_prov_nm=data.get("servicing_prov_nm", ""),
-            billing_npi=data.get("billing_npi", ""),
-            carrier_id=data.get("carrier_id", ""),
-            carrier_name=data.get("carrier_name", ""),
-            payment_number=data.get("payment_number", ""),
-            payment_date=data.get("payment_date", ""),
-            interest_amount=data.get("interest_amount", ""),
-            total_payable_to_provider=data.get("total_payable_to_provider", ""),
-        )
-        for sl in data.get("service_lines", []):
-            record.service_lines.append(ServiceLine(
-                date_of_service=sl.get("date_of_service", ""),
-                description=sl.get("description", ""),
-                units=sl.get("units", "1"),
-                billed_amt=sl.get("billed_amt", "0.00"),
-                disallow_amt=sl.get("disallow_amt", "0.00"),
-                allowed_amt=sl.get("allowed_amt", "0.00"),
-                deduct_amt=sl.get("deduct_amt", "0.00"),
-                copay_coins_amt=sl.get("copay_coins_amt", "0.00"),
-                cob_pmt_amt=sl.get("cob_pmt_amt", "0.00"),
-                withhold_amt=sl.get("withhold_amt", "0.00"),
-                paid_to_provider_amt=sl.get("paid_to_provider_amt", "0.00"),
-                patient_resp_amt=sl.get("patient_resp_amt", "0.00"),
-            ))
-        db.session.add(record)
+        def norm(value):
+            return (value or "").strip().lower()
+
+        def find_existing_record(parsed_claim):
+            claim_number = norm(parsed_claim.get("claim_number"))
+            patient_name = norm(parsed_claim.get("patient_name"))
+            payment_number = norm(parsed_claim.get("payment_number"))
+            patient_account = norm(parsed_claim.get("patient_account"))
+
+            # Primary duplicate key: claim number (optionally scoped by patient/payment).
+            if claim_number:
+                query = EOBRecord.query.filter(EOBRecord.claim_number.ilike(claim_number))
+                if patient_name:
+                    query = query.filter(EOBRecord.patient_name.ilike(patient_name))
+                if payment_number:
+                    query = query.filter(EOBRecord.payment_number.ilike(payment_number))
+                existing = query.order_by(EOBRecord.id.desc()).first()
+                if existing:
+                    return existing
+
+            # Fallback duplicate key when claim number is missing.
+            if patient_name and (payment_number or patient_account):
+                query = EOBRecord.query.filter(EOBRecord.patient_name.ilike(patient_name))
+                if payment_number:
+                    query = query.filter(EOBRecord.payment_number.ilike(payment_number))
+                if patient_account:
+                    query = query.filter(EOBRecord.patient_account.ilike(patient_account))
+                existing = query.order_by(EOBRecord.id.desc()).first()
+                if existing:
+                    return existing
+
+            return None
+
+        def save_record(parsed_claim):
+            used_ocr = bool(data.get("_notice"))
+            rec = find_existing_record(parsed_claim)
+            is_update = rec is not None
+
+            if not rec:
+                rec = EOBRecord()
+                db.session.add(rec)
+
+            rec.filename = filename
+            rec.used_ocr = used_ocr
+            rec.patient_name = parsed_claim.get("patient_name", "")
+            rec.subscriber_id = parsed_claim.get("subscriber_id", "")
+            rec.member_id = parsed_claim.get("member_id", "")
+            rec.subscriber_name = parsed_claim.get("subscriber_name", "")
+            rec.date_received = parsed_claim.get("date_received", "")
+            rec.pcp_number = parsed_claim.get("pcp_number", "")
+            rec.pcp_name = parsed_claim.get("pcp_name", "")
+            rec.claim_number = parsed_claim.get("claim_number", "")
+            rec.remit_detail = parsed_claim.get("remit_detail", "")
+            rec.patient_account = parsed_claim.get("patient_account", "")
+            rec.product_desc = parsed_claim.get("product_desc", "")
+            rec.servicing_prov_npi = parsed_claim.get("servicing_prov_npi", "")
+            rec.servicing_prov_nm = parsed_claim.get("servicing_prov_nm", "")
+            rec.billing_npi = parsed_claim.get("billing_npi", "")
+            rec.carrier_id = parsed_claim.get("carrier_id", "")
+            rec.carrier_name = parsed_claim.get("carrier_name", "")
+            rec.payment_number = parsed_claim.get("payment_number", "")
+            rec.payment_date = parsed_claim.get("payment_date", "")
+            rec.interest_amount = parsed_claim.get("interest_amount", "")
+            rec.total_payable_to_provider = parsed_claim.get("total_payable_to_provider", "")
+
+            # Replace line items fully on update to prevent duplicate service lines.
+            rec.service_lines.clear()
+            for sl in parsed_claim.get("service_lines", []):
+                rec.service_lines.append(ServiceLine(
+                    date_of_service=sl.get("date_of_service", ""),
+                    description=sl.get("description", ""),
+                    units=sl.get("units", "1"),
+                    billed_amt=sl.get("billed_amt", "0.00"),
+                    disallow_amt=sl.get("disallow_amt", "0.00"),
+                    allowed_amt=sl.get("allowed_amt", "0.00"),
+                    deduct_amt=sl.get("deduct_amt", "0.00"),
+                    copay_coins_amt=sl.get("copay_coins_amt", "0.00"),
+                    cob_pmt_amt=sl.get("cob_pmt_amt", "0.00"),
+                    withhold_amt=sl.get("withhold_amt", "0.00"),
+                    paid_to_provider_amt=sl.get("paid_to_provider_amt", "0.00"),
+                    patient_resp_amt=sl.get("patient_resp_amt", "0.00"),
+                ))
+            return rec, is_update
+
+        parsed_claims = data.get("_records") or [data]
+
+        # If the parser returned a notice AND no usable data was extracted
+        # (e.g. OCR completely failed), skip DB save and return immediately.
+        if data.get("_notice"):
+            any_data = any(
+                c.get("patient_name") or c.get("claim_number") or c.get("service_lines")
+                for c in parsed_claims
+            )
+            if not any_data:
+                response_records = []
+                for claim in parsed_claims:
+                    claim_payload = dict(claim)
+                    claim_payload["_notice"] = data["_notice"]
+                    response_records.append(claim_payload)
+                primary = response_records[0]
+                return jsonify({
+                    "success": True,
+                    "data": primary,
+                    "records": response_records,
+                    "total_records": len(response_records),
+                    "updated_existing": 0,
+                })
+
+        saved_records = []
+        updated_count = 0
+        skipped = 0
+        for claim in parsed_claims:
+            # Skip claims with no meaningful data
+            has_data = (
+                claim.get("patient_name")
+                or claim.get("claim_number")
+                or claim.get("service_lines")
+            )
+            if not has_data:
+                skipped += 1
+                continue
+            record, is_update = save_record(claim)
+            saved_records.append(record)
+            if is_update:
+                updated_count += 1
+
+        if not saved_records:
+            db.session.rollback()
+            return jsonify({
+                "error": "PDF was parsed but no patient or claim data could be extracted."
+            }), 400
+
         db.session.commit()
 
-        data["_record_id"] = record.id
-        return jsonify({"success": True, "data": data})
+        response_records = []
+        for idx, rec in enumerate(saved_records):
+            # Find matching parsed claim for this saved record
+            claim_payload = {}
+            for claim in parsed_claims:
+                if (claim.get("claim_number") == rec.claim_number
+                        and claim.get("patient_name") == rec.patient_name):
+                    claim_payload = dict(claim)
+                    break
+            if not claim_payload:
+                claim_payload = saved_records[idx].to_dict()
+            claim_payload["_record_id"] = rec.id
+            if data.get("_notice"):
+                claim_payload["_notice"] = data["_notice"]
+            response_records.append(claim_payload)
+
+        primary = response_records[0]
+        return jsonify({
+            "success": True,
+            "data": primary,
+            "records": response_records,
+            "total_records": len(response_records),
+            "updated_existing": updated_count,
+        })
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Failed to parse PDF: {str(e)}"}), 500

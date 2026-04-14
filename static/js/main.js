@@ -3,6 +3,11 @@
 const pdfInput = document.getElementById('pdfInput');
 const uploadArea = document.getElementById('uploadArea');
 const uploadStatus = document.getElementById('uploadStatus');
+const claimSwitcher = document.getElementById('claimSwitcher');
+const claimSelect = document.getElementById('claimSelect');
+const claimMeta = document.getElementById('claimMeta');
+
+let parsedClaims = [];
 
 // Drag & Drop support
 uploadArea.addEventListener('dragover', (e) => {
@@ -81,23 +86,96 @@ function handleFileUpload(file) {
             return;
         }
 
+        const records = result.records && result.records.length
+            ? result.records
+            : (result.data._records && result.data._records.length
+                ? result.data._records
+                : [result.data]);
+
+        parsedClaims = records;
+        renderClaimSelector(records);
+
         // Show notice if PDF was image-based / OCR-processed
         if (result.data._notice) {
             showNotice(result.data._notice);
-            showStatus('PDF parsed via OCR. Please verify the extracted data.');
-        } else {
-            showStatus('PDF parsed successfully! Form auto-filled.');
         }
-        fillForm(result.data);
+
+        // Check if any meaningful data was extracted
+        const first = records[0] || {};
+        const hasData = first.patient_name || first.claim_number || first.member_id ||
+                        (first.service_lines && first.service_lines.length > 0);
+
+        if (!hasData) {
+            showStatus('PDF parsed but no data could be extracted. Try a different file.', true);
+            return;
+        }
+
+        const ocrTag = result.data._notice ? ' (via OCR — verify data)' : '';
+        if (records.length > 1) {
+            showStatus(`PDF parsed successfully! Found ${records.length} patient claims${ocrTag}.`);
+        } else {
+            showStatus(`PDF parsed successfully! Form auto-filled${ocrTag}.`);
+        }
+
+        fillForm(records[0]);
     })
     .catch(err => {
         showStatus('Upload failed: ' + err.message, true);
     });
 }
 
+function renderClaimSelector(records) {
+    if (!records || records.length <= 1) {
+        claimSwitcher.style.display = 'none';
+        claimSelect.innerHTML = '';
+        claimMeta.textContent = '';
+        return;
+    }
+
+    claimSwitcher.style.display = 'flex';
+    claimSelect.innerHTML = '';
+
+    records.forEach((rec, idx) => {
+        const labelName = rec.patient_name || 'Unknown Patient';
+        const labelClaim = rec.claim_number ? ` | Claim ${rec.claim_number}` : '';
+        const opt = document.createElement('option');
+        opt.value = String(idx);
+        opt.textContent = `${idx + 1}. ${labelName}${labelClaim}`;
+        claimSelect.appendChild(opt);
+    });
+
+    claimSelect.value = '0';
+    claimMeta.textContent = `${records.length} claims extracted from this PDF`;
+}
+
+claimSelect.addEventListener('change', () => {
+    const idx = parseInt(claimSelect.value, 10);
+    if (Number.isNaN(idx) || !parsedClaims[idx]) {
+        return;
+    }
+    fillForm(parsedClaims[idx]);
+});
+
+function resetFormValues() {
+    document.getElementById('billingForm').reset();
+    document.querySelectorAll('.filled').forEach(el => el.classList.remove('filled'));
+
+    document.getElementById('serviceBody').innerHTML = `<tr class="empty-row">
+        <td colspan="13" style="text-align:center;color:#999;padding:20px;">
+            Upload a PDF to auto-fill service line details
+        </td></tr>`;
+
+    ['totalBilled','totalDisallow','totalAllowed','totalDeduct','totalCopay',
+     'totalCob','totalWithhold','totalPaidProvider','totalPatientResp'].forEach(id => {
+        document.getElementById(id).value = '';
+    });
+}
+
 // ===== Auto-Fill Form from Extracted Data =====
 
 function fillForm(data) {
+    resetFormValues();
+
     const fieldMap = {
         'patientName': data.patient_name,
         'claimNumber': data.claim_number,
@@ -287,6 +365,10 @@ function escapeHtml(str) {
 function clearForm() {
     document.getElementById('billingForm').reset();
     document.getElementById('topPatientInfo').textContent = 'PATIENT: --';
+    parsedClaims = [];
+    claimSwitcher.style.display = 'none';
+    claimSelect.innerHTML = '';
+    claimMeta.textContent = '';
 
     // Remove .filled class from all inputs
     document.querySelectorAll('.filled').forEach(el => el.classList.remove('filled'));
