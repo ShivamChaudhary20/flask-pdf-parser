@@ -9,8 +9,8 @@
     <style>
         /* ── Card grid ── */
         .cards-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(540px, 1fr));
+            display: flex;
+            flex-direction: column;
             gap: 16px;
             padding: 0 16px 20px;
         }
@@ -55,7 +55,7 @@
         }
         .card-fields {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(8, 1fr);
             gap: 6px 10px;
         }
         .card-field label {
