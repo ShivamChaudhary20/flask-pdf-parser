@@ -4,23 +4,27 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EOB History - Parsed Records</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ range(1000,9999)|random }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
     <style>
         /* Override container to full width on history page */
-        body { background: #f5f7fa; }
-        .container { max-width: 100% !important; box-shadow: none !important; }
+        body { background: #f0f4f8; }
+        .container { max-width: 100% !important; width: 100% !important; box-shadow: none !important; }
 
-        /* ── Card layout: strictly one per row ── */
+        /* ── ONE card per row, no exceptions ── */
+        #cardsGrid,
         .cards-grid {
-            display: block;
+            display: block !important;
+            width: 100% !important;
             padding: 0 24px 20px;
         }
+        #cardsGrid > div,
         .record-card {
-            display: block;
-            width: 100%;
-            box-sizing: border-box;
-            margin-bottom: 20px;
+            display: block !important;
+            float: none !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+            margin: 0 0 20px 0 !important;
             background: #fff;
             border: 1px solid #d6e4f7;
             border-radius: 10px;
@@ -142,6 +146,7 @@
     <div class="cards-grid" id="cardsGrid">
         <div class="cards-empty">Loading...</div>
     </div>
+    <div style="clear:both"></div>
 
     <!-- Pagination -->
     <div class="pagination" id="pagination"></div>
