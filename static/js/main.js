@@ -236,11 +236,13 @@ function fillForm(data) {
         payMethodEl.classList.add('filled');
     }
 
-    // Fill check/payment number into Authorization #
+    // Fill check/payment number into Check / EFT # field
     if (data.payment_number) {
-        const authEl = document.getElementById('authorizationNum');
-        authEl.value = data.payment_number;
-        authEl.classList.add('filled');
+        const checkEl = document.getElementById('checkEftNum');
+        if (checkEl) {
+            checkEl.value = data.payment_number;
+            checkEl.classList.add('filled');
+        }
     }
 
     // Deposit Date from payment_date (fallback to today)
