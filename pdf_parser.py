@@ -24,7 +24,8 @@ _LABEL_LOOKAHEAD = (
     r"PROVIDER|VENDOR|PLAN|DISPOSITION|STATUS|INSURED|POLICY|CONTRACT|"
     r"ENROLLEE|RENDERING|REFERRING|BENEFIT|COVERAGE|PAYER|INSURANCE|"
     r"LINE\sOF|LOB|CHECK|EFT|NET|ACCOUNT|TAX|DCN|TCN|TRACE|"
-    r"REMARK|ADJUDICATION|PROCESSED|RECEIVED|GROUP|CLAIMANT|BENEFICIARY"
+    r"REMARK|ADJUDICATION|PROCESSED|RECEIVED|GROUP|CLAIMANT|BENEFICIARY|"
+    r"DRAFT|TRANSACTION|VOUCHER|WARRANT|CONTROL|BATCH|DOCUMENT|REFERENCE"
     r")(?:\s+(?:ID|NAME|NPI|NM|NUMBER|DETAIL|ACCOUNT|DESC|AMOUNT|AMT|"
     r"DATE|DISC|TAX|RECEIVED|REFERENCE|PAY|TYPE|CODE|HOLDER|STATUS|"
     r"PLAN|NO))*\.?\s*:"
@@ -144,10 +145,21 @@ FIELD_PATTERNS = {
         r"CARRIER:\s*(.+?)" + _LABEL_LOOKAHEAD,
     ],
     "payment_number": [
+        r"CHECK\s*/\s*EFT\s*(?:NUMBER|#|NO)?\.?:\s*([\w-]+)",      # CHECK/EFT #: (combined)
         r"PAYMENT\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
         r"CHECK\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
-        r"EFT\s*(?:NUMBER|#|NO|TRACE)\.?:\s*([\w-]+)",
+        r"EFT\s*(?:NUMBER|#|NO|TRACE|TRANS(?:ACTION)?)\.?:\s*([\w-]+)",
         r"TRACE\s*(?:NUMBER|#):\s*([\w-]+)",
+        r"RA\s*(?:REFERENCE|REF)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)", # RA #, RA Reference #
+        r"REMIT(?:TANCE)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",         # Remittance #
+        r"DRAFT\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",                   # Draft # (Physicians Mutual)
+        r"TRANSACTION\s*(?:NUMBER|#|NO|ID)\.?:\s*([\w-]+)",          # Transaction #
+        r"VOUCHER\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",                 # Voucher #
+        r"WARRANT\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",                 # Warrant # (govt payers)
+        r"CONTROL\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",                 # Control #
+        r"BATCH\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",                   # Batch #
+        r"DOCUMENT\s*(?:NUMBER|#|NO|ID)\.?:\s*([\w-]+)",             # Document #
+        r"REFERENCE\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",               # Reference #
     ],
     "payment_date": [
         r"PAYMENT\s*DATE:\s*([\d/]+)",
