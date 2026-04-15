@@ -472,6 +472,10 @@ def extract_eob_data(pdf_path):
                                  "Data was extracted using OCR — please verify accuracy.")
         return result
 
+    # ---- Physicians Mutual EPC remittance (multi-patient) ----
+    if _is_physicians_mutual(full_text):
+        return _extract_physicians_mutual_claims(full_text)
+
     data = _new_data_record()
 
     # ---- 1. Extract header fields using multi-pattern matching ----
@@ -1125,6 +1129,147 @@ def _extract_uhc_remittance_claims(full_text):
             }
             rec["service_lines"].append(sl)
             rec["total_payable_to_provider"] = paid
+
+        _compute_derived_fields(rec)
+
+        if rec["patient_name"] or rec["claim_number"]:
+            records.append(rec)
+
+    if not records:
+        return base
+
+    result = records[0]
+    if len(records) > 1:
+        result["_records"] = records
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Physicians Mutual — multi-patient EPC remittance (normal text)
+# ---------------------------------------------------------------------------
+
+def _is_physicians_mutual(full_text):
+    """Detect Physicians Mutual EPC remittance format."""
+    has_pm = bool(re.search(r"Physicians\s+Mutual", full_text, re.IGNORECASE))
+    has_epc = bool(re.search(r"EPC\s+Draft\s*#", full_text, re.IGNORECASE))
+    has_patient = bool(re.search(r"Patient\s+Name:", full_text))
+    return has_pm and has_epc and has_patient
+
+
+def _extract_physicians_mutual_claims(full_text):
+    """Extract multiple patient claims from Physicians Mutual EPC remittance PDF.
+
+    Format: each claim block starts with a 'Provider:' line and contains:
+      Provider: <name>          Patient Acct #: <acct>    Draft #: <draft>
+      Policyowner Name: <name>  Policy #: <policy>
+      Patient Name: <name>      Claim Number: <claim>
+      [service line table rows]
+    Multiple blocks per page, multiple pages.
+    """
+    # Global header fields (same for all blocks on the document)
+    base = _new_data_record()
+    base["carrier_name"] = "Physicians Mutual Insurance Co"
+
+    m = re.search(r"Payment\s+Date:\s*([\d/]+)", full_text, re.IGNORECASE)
+    if m:
+        base["payment_date"] = m.group(1)
+
+    m = re.search(r"EPC\s+Draft\s*#:\s*(\S+)", full_text, re.IGNORECASE)
+    if m:
+        base["payment_number"] = m.group(1)
+
+    m = re.search(r"Tax\s+ID:\s*([\d-]+)", full_text, re.IGNORECASE)
+    if m:
+        base["billing_npi"] = m.group(1)   # store Tax ID in billing_npi slot
+
+    # Split into per-patient blocks at each "Provider:" line that starts a claim
+    # Each block begins with "Provider:" and ends before the next "Provider:"
+    raw_blocks = re.split(r"(?=^Provider:\s)", full_text, flags=re.MULTILINE)
+    claim_blocks = [b for b in raw_blocks if re.match(r"Provider:\s", b.strip())]
+
+    if not claim_blocks:
+        return base
+
+    records = []
+    for block in claim_blocks:
+        rec = _new_data_record()
+        rec["carrier_name"] = base["carrier_name"]
+        rec["payment_date"] = base["payment_date"]
+        rec["payment_number"] = base["payment_number"]
+        rec["billing_npi"] = base["billing_npi"]
+
+        # Provider name
+        m = re.search(r"Provider:\s*(.+?)(?:\s{2,}|\t|Patient\s+Acct)", block)
+        if m:
+            rec["servicing_prov_nm"] = m.group(1).strip()
+
+        # Patient Acct #
+        m = re.search(r"Patient\s+Acct\s*#:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            rec["patient_account"] = m.group(1).strip()
+
+        # Draft # (payment/check number per claim)
+        m = re.search(r"Draft\s*#:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            rec["payment_number"] = m.group(1).strip()
+
+        # Policyowner Name → subscriber_name
+        m = re.search(r"Policyowner\s+Name:\s*([A-Z][A-Z .'-]+?)(?:\s{2,}|\t|Policy\s*#|$)", block, re.MULTILINE)
+        if m:
+            rec["subscriber_name"] = m.group(1).strip()
+
+        # Policy # → subscriber_id
+        m = re.search(r"Policy\s*#:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            rec["subscriber_id"] = m.group(1).strip()
+
+        # Patient Name
+        m = re.search(r"Patient\s+Name:\s*([A-Z][A-Z .'-]+?)(?:\s{2,}|\t|Claim\s+Number|$)", block, re.MULTILINE)
+        if m:
+            rec["patient_name"] = m.group(1).strip()
+
+        # Claim Number
+        m = re.search(r"Claim\s+Number:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            rec["claim_number"] = m.group(1).strip()
+
+        # Service lines — parse each data row (date, code, total, allowed, deduct, copay, carc, paid)
+        # Rows look like: "03/02/26  99214  180.00  26.57  0.00  0.00  45  26.57"
+        total_paid = 0.0
+        for row_m in re.finditer(
+            r"(\d{2}/\d{2}/\d{2,4})\s+(\w+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+\S+\s+([\d.]+)",
+            block
+        ):
+            dos, code, total_charge, allowed, deduct, copay, paid = row_m.groups()
+            billed = _clean_amount(total_charge)
+            allowed_amt = _clean_amount(allowed)
+            deduct_amt = _clean_amount(deduct)
+            copay_amt = _clean_amount(copay)
+            paid_amt = _clean_amount(paid)
+            disallow = f"{max(0.0, _safe_float(billed) - _safe_float(allowed_amt)):.2f}"
+            sl = {
+                "date_of_service": dos,
+                "description": code,
+                "units": "1",
+                "billed_amt": billed,
+                "disallow_amt": disallow,
+                "allowed_amt": allowed_amt,
+                "deduct_amt": deduct_amt,
+                "copay_coins_amt": copay_amt,
+                "cob_pmt_amt": "0.00",
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": paid_amt,
+                "patient_resp_amt": f"{_safe_float(deduct_amt) + _safe_float(copay_amt):.2f}",
+            }
+            rec["service_lines"].append(sl)
+            total_paid += _safe_float(paid_amt)
+
+        # Total payable — try explicit "Total:" row first
+        m = re.search(r"Total:\s+([\d.]+)\s+([\d.]+)", block, re.IGNORECASE)
+        if m:
+            rec["total_payable_to_provider"] = _clean_amount(m.group(2))
+        elif total_paid > 0:
+            rec["total_payable_to_provider"] = f"{total_paid:.2f}"
 
         _compute_derived_fields(rec)
 
