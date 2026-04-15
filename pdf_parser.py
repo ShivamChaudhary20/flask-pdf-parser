@@ -376,23 +376,36 @@ def _new_data_record():
 # OCR fallback for scanned / image-based PDFs
 # ---------------------------------------------------------------------------
 
-def _ocr_pdf(pdf_path, max_pages=5, timeout_per_page=15):
+def _ocr_pdf(pdf_path, max_pages=8, timeout_per_page=15):
     """Convert PDF to images and run OCR on each page.
 
-    Uses a per-page timeout and page limit to avoid hanging on large
-    scanned documents.  DPI kept at 150 for speed; sufficient for
-    typical EOB/remittance text.
-
-    Automatically detects and corrects page rotation via Tesseract OSD
-    before running OCR, which fixes sideways/rotated scanned pages.
+    Converts one page at a time to avoid OOM on large multi-page scans.
+    Uses DPI 120 for speed/memory balance; sufficient for typical EOB text.
+    Automatically detects and corrects page rotation via Tesseract OSD.
     """
     try:
-        images = convert_from_path(pdf_path, dpi=150, first_page=1,
-                                   last_page=max_pages)
+        # Get total page count without loading images
+        from pdf2image.pdf2image import pdfinfo_from_path
+        try:
+            info = pdfinfo_from_path(pdf_path)
+            total_pages = min(info.get("Pages", max_pages), max_pages)
+        except Exception:
+            total_pages = max_pages
+
         pages_text = []
-        for img in images:
+        for page_num in range(1, total_pages + 1):
             try:
-                # Detect rotation via OSD and correct before OCR
+                # Convert a single page — much lower peak memory than batch
+                images = convert_from_path(
+                    pdf_path, dpi=120,
+                    first_page=page_num, last_page=page_num
+                )
+                if not images:
+                    continue
+                img = images[0]
+                del images  # free immediately
+
+                # Detect and correct rotation via OSD
                 try:
                     osd = pytesseract.image_to_osd(img, timeout=timeout_per_page)
                     rot_line = [l for l in osd.split('\n') if l.startswith('Rotate:')]
@@ -403,10 +416,13 @@ def _ocr_pdf(pdf_path, max_pages=5, timeout_per_page=15):
                     pass  # OSD failed — proceed with original orientation
 
                 text = pytesseract.image_to_string(img, timeout=timeout_per_page)
+                del img  # free immediately
                 pages_text.append(text)
             except RuntimeError:
-                # Timeout on this page — skip it
-                pages_text.append("")
+                pages_text.append("")  # timeout — skip page
+            except Exception:
+                pages_text.append("")  # any other error — skip page
+
         return "\n".join(pages_text)
     except Exception:
         return ""
