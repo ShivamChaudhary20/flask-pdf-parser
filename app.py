@@ -8,7 +8,7 @@ import pdfplumber
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads")
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB max
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB max
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "eob_data.db"
 )
@@ -152,6 +152,8 @@ def upload_pdf():
                 for claim in parsed_claims:
                     claim_payload = dict(claim)
                     claim_payload["_notice"] = data["_notice"]
+                    claim_payload.pop("_records", None)
+                    claim_payload.pop("_raw_text", None)
                     response_records.append(claim_payload)
                 primary = response_records[0]
                 return jsonify({
@@ -202,6 +204,9 @@ def upload_pdf():
             claim_payload["_record_id"] = rec.id
             if data.get("_notice"):
                 claim_payload["_notice"] = data["_notice"]
+            # Strip internal keys that cause circular refs or bloat
+            claim_payload.pop("_records", None)
+            claim_payload.pop("_raw_text", None)
             response_records.append(claim_payload)
 
         primary = response_records[0]
@@ -214,11 +219,17 @@ def upload_pdf():
         })
     except Exception as e:
         db.session.rollback()
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": f"Failed to parse PDF: {str(e)}"}), 500
     finally:
-        # Clean up uploaded file after processing
+        # Clean up uploaded file after successful processing
+        # Keep file on error for debugging
         if os.path.exists(filepath):
-            os.remove(filepath)
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
 
 
 @app.route("/debug-upload", methods=["POST"])

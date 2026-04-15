@@ -369,6 +369,9 @@ def _ocr_pdf(pdf_path, max_pages=5, timeout_per_page=15):
     Uses a per-page timeout and page limit to avoid hanging on large
     scanned documents.  DPI kept at 150 for speed; sufficient for
     typical EOB/remittance text.
+
+    Automatically detects and corrects page rotation via Tesseract OSD
+    before running OCR, which fixes sideways/rotated scanned pages.
     """
     try:
         images = convert_from_path(pdf_path, dpi=150, first_page=1,
@@ -376,6 +379,16 @@ def _ocr_pdf(pdf_path, max_pages=5, timeout_per_page=15):
         pages_text = []
         for img in images:
             try:
+                # Detect rotation via OSD and correct before OCR
+                try:
+                    osd = pytesseract.image_to_osd(img, timeout=timeout_per_page)
+                    rot_line = [l for l in osd.split('\n') if l.startswith('Rotate:')]
+                    rot = int(rot_line[0].split(':')[1].strip()) if rot_line else 0
+                    if rot != 0:
+                        img = img.rotate(-rot, expand=True)
+                except Exception:
+                    pass  # OSD failed — proceed with original orientation
+
                 text = pytesseract.image_to_string(img, timeout=timeout_per_page)
                 pages_text.append(text)
             except RuntimeError:
@@ -394,19 +407,32 @@ def extract_eob_data(pdf_path):
     """Extract medical billing EOB data from a PDF file."""
     full_text = ""
     tables = []
+    pdfplumber_failed = False
 
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            full_text += page_text + "\n"
-            page_tables = page.extract_tables()
-            if page_tables:
-                tables.extend(page_tables)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                full_text += page_text + "\n"
+                page_tables = page.extract_tables()
+                if page_tables:
+                    tables.extend(page_tables)
+    except Exception:
+        # Handles circular reference, corrupt PDF structure, etc.
+        # Try pypdf as fallback (different parser, more lenient)
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(pdf_path)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                full_text += page_text + "\n"
+        except Exception:
+            pdfplumber_failed = True
 
     # --- OCR fallback for image-based / scanned PDFs ---
     text_stripped = full_text.strip()
     used_ocr = False
-    if len(text_stripped) < 50:
+    if pdfplumber_failed or len(text_stripped) < 50:
         if OCR_AVAILABLE:
             ocr_text = _ocr_pdf(pdf_path)
             if ocr_text.strip():
@@ -429,6 +455,22 @@ def extract_eob_data(pdf_path):
             )
             return data
 
+    # ---- Aetna "Summary of Claim Payment" (reversed text) early detection ----
+    if "tneitaP :emaN" in full_text or "noitanalpxE fO stifeneB" in full_text:
+        return _extract_aetna_claims(full_text, tables)
+
+    # ---- Aetna "Explanation of Benefits" (normal text, multi-patient) ----
+    if _is_aetna_eob(full_text):
+        return _extract_aetna_eob_claims(full_text, tables)
+
+    # ---- UHC "Provider Remittance Advice" (OCR, multi-patient) ----
+    if _is_uhc_remittance(full_text):
+        result = _extract_uhc_remittance_claims(full_text)
+        if used_ocr:
+            result["_notice"] = ("This PDF is an image/scanned document. "
+                                 "Data was extracted using OCR — please verify accuracy.")
+        return result
+
     data = _new_data_record()
 
     # ---- 1. Extract header fields using multi-pattern matching ----
@@ -447,6 +489,143 @@ def extract_eob_data(pdf_path):
                     break
         for f in matched_in_line:
             remaining_fields.discard(f)
+
+    # ---- 1b. Header-row / value-row extraction (portal-style PDFs) ----
+    # Priority Health and similar portals use "header row then value row" format.
+    # We match specific known header patterns and parse the corresponding value line.
+    _hv_patterns = [
+        # (header regex, value regex with named groups)
+        (
+            r"Status\s+Member\s*Name\s+Contract\s*Number\s+Service\s*Date",
+            r"\S+\s+(?P<patient_name>.+?)\s+(?P<member_id>\d[\d-]+)\s+(?P<date_received>\d{1,2}/\d{1,2}/\d{2,4})"
+        ),
+        (
+            r"Provider\s+Claim\s*Number\s+Paid\s*Date\s+Total\s+(?:Priority|Plan)\s*Paid",
+            r"(?P<servicing_prov_nm>.+?)\s+(?P<claim_number>\d{6,})\s+(?P<payment_date>\d{1,2}/\d{1,2}/\d{2,4})\s+\$?(?P<total_payable_to_provider>[\d,.]+)"
+        ),
+        (
+            r"Billed\s*Amount\s+Account\s*Number\s+Medical\s*Plan\s+Provider",
+            r"\$?[\d,.]+\s+(?P<member_id_alt>\w+)\s+(?P<product_desc>\S+)\s+(?P<servicing_prov_nm_alt>.+)"
+        ),
+        (
+            r"Provider\s*Id\s+Tax\s*Id\s+Service\s*Date\s+Claim\s*Received",
+            r"(?P<pcp_number>\d+)\s+\S+\s+(?P<svc_date>[\d-]+)\s+(?P<claim_received>[\d-]+)"
+        ),
+        (
+            r"Paid\s*Date\s+Submitted\s*DRG\s+Voucher\s*#\s+Check\s*#",
+            r"[\d-]+\s+\S+\s+(?P<payment_number_alt>\w+)\s+(?P<payment_number>\d+)"
+        ),
+    ]
+    for i, line in enumerate(lines[:-1]):
+        stripped = line.strip()
+        for hdr_re, val_re in _hv_patterns:
+            if not re.search(hdr_re, stripped, re.IGNORECASE):
+                continue
+            # Get next non-empty, non-nav line
+            for j in range(i + 1, min(i + 3, len(lines))):
+                candidate = lines[j].strip()
+                if candidate and not candidate.startswith("http") and not candidate.startswith("(/"):
+                    m = re.match(val_re, candidate, re.IGNORECASE)
+                    if m:
+                        for key, val in m.groupdict().items():
+                            val = (val or "").strip()
+                            if not val or val == "--":
+                                continue
+                            # Handle _alt fields (only fill if main is empty)
+                            real_key = key.replace("_alt", "")
+                            if real_key == "servicing_prov_nm":
+                                val = val.replace(" null ", " ").strip()
+                            if real_key == "svc_date":
+                                if not data.get("date_received"):
+                                    data["date_received"] = val
+                                continue
+                            if real_key == "claim_received":
+                                if not data.get("date_received"):
+                                    data["date_received"] = val
+                                continue
+                            if not data.get(real_key):
+                                data[real_key] = val
+                    break
+
+    # ---- 1c. Priority Health service line extraction from text ----
+    if not data.get("_ph_svc_extracted"):
+        for i, line in enumerate(lines):
+            # Look for "Code Description Units Billed Amount"
+            if re.search(r"Code\s+Description\s+Units\s+Billed", line, re.IGNORECASE):
+                # Next non-empty line(s) contain the service line data
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    svc_line = lines[j].strip()
+                    if not svc_line or svc_line.lower().startswith("deductible"):
+                        break
+                    # Pattern: CODE DESCRIPTION UNITS $AMOUNT
+                    m = re.match(r"(\w+)\s+(.+?)\s+(\d+)\s+\$?([\d,.]+)", svc_line)
+                    if m:
+                        code, desc, units, billed = m.group(1), m.group(2).strip(), m.group(3), m.group(4)
+                        sl = {
+                            "date_of_service": data.get("date_received", ""),
+                            "description": f"{code} {desc}",
+                            "units": units,
+                            "billed_amt": billed,
+                            "disallow_amt": "0.00",
+                            "allowed_amt": "0.00",
+                            "deduct_amt": "0.00",
+                            "copay_coins_amt": "0.00",
+                            "cob_pmt_amt": "0.00",
+                            "withhold_amt": "0.00",
+                            "paid_to_provider_amt": "0.00",
+                            "patient_resp_amt": "0.00",                                                                                                                                                                     
+                        }
+                        data["service_lines"].append(sl)
+                break
+        # Fill amounts from "Line Paid Detail" section
+        for i, line in enumerate(lines):
+            if re.search(r"Line\s+Paid\s+Detail", line, re.IGNORECASE):
+                # Next lines: header then values
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    hdr = lines[j].strip()
+                    if re.search(r"Allowed\s+.*(?:Other|Insurance|Capitation)", hdr, re.IGNORECASE):
+                        if j + 1 < len(lines):
+                            vals = re.findall(r"\$?([\d,.]+)", lines[j + 1])
+                            if vals and data["service_lines"]:
+                                sl = data["service_lines"][-1]
+                                sl["allowed_amt"] = vals[0]
+                    if re.search(r"Total\s+Patient\s+Liability", hdr, re.IGNORECASE):
+                        if j + 1 < len(lines):
+                            vals = re.findall(r"\$?([\d,.]+)", lines[j + 1])
+                            if vals and data["service_lines"]:
+                                sl = data["service_lines"][-1]
+                                sl["patient_resp_amt"] = vals[0]
+                                if len(vals) >= 2:
+                                    sl["copay_coins_amt"] = vals[1]
+                                if len(vals) >= 3:
+                                    sl["deduct_amt"] = vals[2]
+                    if re.search(r"Priority\s+Health\s+Paid", hdr, re.IGNORECASE):
+                        vals = re.findall(r"\$?([\d,.]+)", hdr)
+                        if not vals and j + 1 < len(lines):
+                            vals = re.findall(r"\$?([\d,.]+)", lines[j + 1])
+                        if vals and data["service_lines"]:
+                            sl = data["service_lines"][-1]
+                            sl["paid_to_provider_amt"] = vals[-1]
+                break
+        # Compute disallow from billed - allowed
+        for sl in data["service_lines"]:
+            try:
+                b = float(sl.get("billed_amt", 0))
+                a = float(sl.get("allowed_amt", 0))
+                if b > a > 0:
+                    sl["disallow_amt"] = "%.2f" % (b - a)
+            except (ValueError, TypeError):
+                pass
+
+    # ---- 1e. Priority Health carrier detection ----
+    if not data.get("carrier_name"):
+        for line in lines:
+            if re.search(r"priority\s*health", line, re.IGNORECASE):
+                data["carrier_name"] = "Priority Health"
+                break
+            if "priorityhealth.com" in line.lower():
+                data["carrier_name"] = "Priority Health"
+                break
 
     # ---- 2. Extract service lines from tables (smart column mapping) ----
     _extract_service_lines_from_tables(tables, data)
@@ -703,6 +882,714 @@ def _extract_service_lines_from_tables(tables, data):
         data["service_lines"] = best_lines
 
 
+# ---------------------------------------------------------------------------
+# UHC "Provider Remittance Advice" — OCR, multi-patient
+# ---------------------------------------------------------------------------
+
+def _is_uhc_remittance(full_text):
+    """Detect UHC Provider Remittance Advice format."""
+    has_pra = bool(re.search(r"PROVIDER\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE))
+    has_subscriber = bool(re.search(r"SUBSCRIBER\s+ID:", full_text))
+    has_uhc = bool(re.search(r"UnitedHealthcare", full_text, re.IGNORECASE))
+    return has_pra and has_subscriber and has_uhc
+
+
+def _extract_uhc_remittance_claims(full_text):
+    """Extract multi-patient claims from UHC Provider Remittance Advice OCR text.
+
+    Structure:
+    - Header with PAYMENT DATE, PAYEE info, PAYMENT AMOUNT
+    - Per-patient blocks starting with SUBSCRIBER ID: line
+    - Each block: header fields on SUBSCRIBER/MEMBER lines, then a
+      SUBTOTAL line with CLAIM NUMBER + amounts
+    - PAYEE TOTALS at the end
+    """
+    base = _new_data_record()
+    base["carrier_name"] = "UnitedHealthcare"
+
+    # --- Header fields ---
+    m = re.search(r"PAYMENT\s+DATE:\s*(\d{2}/\d{2}/\d{2,4})", full_text)
+    if m:
+        base["payment_date"] = m.group(1)
+
+    # Payment number — OCR often splits label/value across lines
+    m = re.search(r"PAYMENT\s+NUMBER:\s*(\d\S+)", full_text)
+    if not m:
+        m = re.search(r"(\d{5}[A-Z]\d{10,})", full_text)
+    if m:
+        base["payment_number"] = m.group(1)
+
+    m = re.search(r"PAYMENT\s+AMOUNT:\s*\$?([\d,.]+)", full_text)
+    if not m:
+        # Look for NET PAID AMOUNT in the header
+        m = re.search(r"NET\s+PAID\s+AMOUNT\s+\$?([\d,.]+)", full_text)
+    if m:
+        base["total_payable_to_provider"] = m.group(1).replace(",", "")
+
+    # --- Split at SUBSCRIBER ID: to get per-patient blocks ---
+    blocks = re.split(r"(?=SUBSCRIBER\s+ID:)", full_text)
+    subscriber_blocks = [b for b in blocks if re.match(r"SUBSCRIBER\s+ID:", b.strip())]
+
+    if not subscriber_blocks:
+        return base
+
+    records = []
+    for block in subscriber_blocks:
+        rec = _new_data_record()
+        rec["carrier_name"] = base["carrier_name"]
+        rec["payment_date"] = base.get("payment_date", "")
+        rec["payment_number"] = base.get("payment_number", "")
+
+        # Subscriber ID
+        m = re.search(r"SUBSCRIBER\s+ID:\s*(\S+)", block)
+        if m:
+            rec["subscriber_id"] = m.group(1)
+
+        # Subscriber Name
+        m = re.search(r"SUBSCRIBER\s+NAME:\s*([A-Z][A-Z ,.'`-]+?)(?:\s+DATE\s+RECEIVED:|\s*$)", block, re.MULTILINE)
+        if m:
+            rec["subscriber_name"] = m.group(1).strip().rstrip(",")
+
+        # Patient name — in UHC remittance, subscriber IS the patient
+        rec["patient_name"] = rec["subscriber_name"]
+
+        # Date Received
+        m = re.search(r"DATE\s+RECEIVED:\s*([\d/]+)", block)
+        if m:
+            rec["date_received"] = m.group(1)
+
+        # Claim Number (from SUBSCRIBER line)
+        m = re.search(r"CLAIM\s+NUMBER:\s*(\S+)", block)
+        if m:
+            rec["claim_number"] = m.group(1)
+
+        # Patient Account
+        m = re.search(r"PATIENT\s+ACCOU(?:NT)?:?\s*(\S+)", block)
+        if m:
+            rec["patient_account"] = m.group(1)
+
+        # Member ID
+        m = re.search(r"MEMBER\s+ID:\s*(\S+)", block)
+        if m:
+            rec["member_id"] = m.group(1)
+
+        # Interest Amount
+        m = re.search(r"INTEREST\s+AMOUNT:\s*\$?([\d,.]+)", block)
+        if m:
+            rec["interest_amount"] = m.group(1).replace(",", "")
+
+        # PCP Number
+        m = re.search(r"PCP\s+NUMBER:\s*(\S+)", block)
+        if m:
+            rec["pcp_number"] = m.group(1)
+
+        # Remit Detail
+        m = re.search(r"REMIT\s+DETAIL:\s*(.+?)(?:\s+PRODUCT\s+DESC:|\s*$)", block, re.MULTILINE)
+        if m:
+            rec["remit_detail"] = m.group(1).strip()
+
+        # Product Desc
+        m = re.search(r"PRODUCT\s+DESC:\s*(.+?)$", block, re.MULTILINE)
+        if m:
+            rec["product_desc"] = m.group(1).strip()
+
+        # Servicing Provider NPI
+        m = re.search(r"SERVICING\s+PROV\s+NPI:\s*(\d+)", block)
+        if m:
+            rec["servicing_prov_npi"] = m.group(1)
+
+        # Servicing Provider Name
+        m = re.search(r"SERVICING\s+PROV\s+NM:\s*(.+?)(?:\s+PCP\s+NAME:|\s*$)", block, re.MULTILINE)
+        if m:
+            rec["servicing_prov_nm"] = m.group(1).strip()
+
+        # PCP Name
+        m = re.search(r"PCP\s+NAME:\s*(.+?)(?:\s+BILLING\s+NPI:|\s*$)", block, re.MULTILINE)
+        if m:
+            rec["pcp_name"] = m.group(1).strip()
+
+        # Billing NPI
+        m = re.search(r"BILLING\s+NPI:\s*(\d+)", block)
+        if m:
+            rec["billing_npi"] = m.group(1)
+
+        # --- Service line amounts from SUBTOTAL line ---
+        # SUBTOTAL pattern: "CLAIM NUMBER: xxx| $225.00] $115.83 $109.17] $20.00] $0.00] $0.00] $69.17 $20.00"
+        # OCR often garbles amounts (drops decimals, misreads digits).
+        # Strategy: find the SUBTOTAL line, extract all dollar-like tokens,
+        # then map to columns: BILLED, DISALLOW, ALLOWED, DEDUCT, COPAY, COB, PAID, PT_RESP
+
+        subtotal_line = ""
+        block_lines = block.split("\n")
+        for bl in block_lines:
+            # SUBTOTAL line has CLAIM NUMBER + multiple $ amounts
+            if re.search(r"CLAIM\s+NUMBER:.*\$", bl):
+                subtotal_line = bl
+                break
+
+        if subtotal_line:
+            # Strip the CLAIM NUMBER prefix to avoid claim digits in amounts
+            amounts_part = re.sub(r"^.*?CLAIM\s+NUMBER:\s*\S+\|?\s*", "", subtotal_line)
+            # Extract all dollar-like tokens (with or without $ prefix, with .xx or not)
+            raw_amounts = re.findall(r"[\$]?([\d,]+\.?\d*)\]?", amounts_part)
+            # Filter out noise
+            amounts = []
+            for a in raw_amounts:
+                a_clean = a.replace(",", "")
+                # Skip long digit strings without decimals (leftover claim number fragments)
+                if len(a_clean) >= 6 and "." not in a_clean:
+                    continue
+                # Skip single digits
+                if len(a_clean) <= 1:
+                    continue
+                amounts.append(a_clean)
+
+            # Typical UHC SUBTOTAL has 8 amount columns:
+            # BILLED, DISALLOW, ALLOWED, DEDUCT, COPAY, COB, PAID_TO_PROVIDER, PATIENT_RESP
+            if len(amounts) >= 8:
+                billed, disallow, allowed, deduct = amounts[0], amounts[1], amounts[2], amounts[3]
+                copay, cob, paid, pt_resp = amounts[4], amounts[5], amounts[6], amounts[7]
+            elif len(amounts) >= 6:
+                billed = amounts[0]
+                allowed = amounts[1] if len(amounts) > 1 else "0.00"
+                deduct = amounts[2] if len(amounts) > 2 else "0.00"
+                copay = amounts[3] if len(amounts) > 3 else "0.00"
+                paid = amounts[-2] if len(amounts) > 1 else "0.00"
+                pt_resp = amounts[-1]
+                disallow = "0.00"
+                cob = "0.00"
+            else:
+                billed = amounts[0] if amounts else "0.00"
+                paid = amounts[-1] if len(amounts) > 1 else "0.00"
+                allowed = deduct = copay = cob = disallow = pt_resp = "0.00"
+
+            # OCR fix: amounts without decimal points — add .00 or insert decimal
+            def _fix_ocr_amount(val):
+                """Fix OCR-garbled amounts: '1588' -> '15.88', '2000' -> '20.00'."""
+                if not val or val == "0" or "." in val:
+                    return _clean_amount(val)
+                v = val.replace(",", "")
+                if len(v) >= 3:
+                    # Insert decimal before last 2 digits
+                    return _clean_amount(v[:-2] + "." + v[-2:])
+                return _clean_amount(val)
+
+            billed = _fix_ocr_amount(billed)
+            allowed = _fix_ocr_amount(allowed)
+            deduct = _fix_ocr_amount(deduct)
+            copay = _fix_ocr_amount(copay)
+            cob = _fix_ocr_amount(cob)
+            paid = _fix_ocr_amount(paid)
+            pt_resp = _fix_ocr_amount(pt_resp)
+            # Always compute disallow from billed - allowed; OCR garbles it too often
+            try:
+                disallow = "%.2f" % max(0, float(billed) - float(allowed))
+            except (ValueError, TypeError):
+                disallow = _fix_ocr_amount(disallow)
+
+            # Find a service date from the block (skip DATE RECEIVED)
+            dates = re.findall(r"(\d{2}/\d{2}/\d{2,4})", block)
+            date_received = rec.get("date_received", "")
+            svc_date = ""
+            for d in dates:
+                if d != date_received:
+                    svc_date = d
+                    break
+
+            # Find procedure code (e.g., "9214-95" or "90214-95")
+            code_match = re.search(r"(\d{4,5}-?\d{0,2})\s+POS", block)
+            desc = code_match.group(1) if code_match else ""
+
+            sl = {
+                "date_of_service": svc_date or rec.get("date_received", ""),
+                "description": desc,
+                "units": "1",
+                "billed_amt": billed,
+                "disallow_amt": disallow,
+                "allowed_amt": allowed,
+                "deduct_amt": deduct,
+                "copay_coins_amt": copay,
+                "cob_pmt_amt": cob,
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": paid,
+                "patient_resp_amt": pt_resp,
+            }
+            rec["service_lines"].append(sl)
+            rec["total_payable_to_provider"] = paid
+
+        _compute_derived_fields(rec)
+
+        if rec["patient_name"] or rec["claim_number"]:
+            records.append(rec)
+
+    if not records:
+        return base
+
+    result = records[0]
+    if len(records) > 1:
+        result["_records"] = records
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Aetna "Explanation of Benefits" — normal text, multi-patient
+# ---------------------------------------------------------------------------
+
+def _is_aetna_eob(full_text):
+    """Detect Aetna 'Explanation of Benefits' format (normal text)."""
+    has_aetna = bool(re.search(r"\baetna\b", full_text, re.IGNORECASE))
+    has_eob = bool(re.search(r"Explanation\s+Of\s+Benefits", full_text, re.IGNORECASE))
+    has_patient_name = bool(re.search(r"Patient\s+Name:", full_text))
+    has_claim_id = bool(re.search(r"Claim\s+ID:", full_text))
+    return has_aetna and has_eob and has_patient_name and has_claim_id
+
+
+def _extract_aetna_eob_claims(full_text, tables):
+    """Extract multiple claims from Aetna 'Explanation of Benefits' PDFs.
+
+    Format features:
+    - 'Patient Name: LEONNA M ARNESON (self)'
+    - 'Claim ID: ...  Recd: ...  Member ID: ...  Patient Account: ...'
+    - Service line tables with SUBMITTED CHARGES, NEGOTIATED AMOUNT, etc.
+    - 'ISSUED AMT: $53.83' or 'ISSUED AMT: NO PAY'
+    - 'Claim Payment: $53.83', 'Total Patient Responsibility: $25.00'
+    """
+    # --- Extract shared header info ---
+    base = _new_data_record()
+    base["carrier_name"] = "Aetna"
+
+    m = re.search(r"Trace\s*Number:\s*([\d]+)", full_text)
+    if m:
+        base["payment_number"] = m.group(1)
+
+    m = re.search(r"Trace\s*Amount:\s*\$?([\d,.]+)", full_text)
+    if m:
+        base["total_payable_to_provider"] = m.group(1).replace(",", "")
+
+    m = re.search(r"Printed:\s*(\d{2}/\d{2}/\d{4})", full_text)
+    if m:
+        base["payment_date"] = m.group(1)
+
+    m = re.search(r"\bNPI:\s*([\d]+)", full_text)
+    if m:
+        base["billing_npi"] = m.group(1)
+
+    m = re.search(r"TIN:\s*([\w]+)", full_text)
+    if m:
+        base["pcp_number"] = m.group(1)
+
+    # --- Split into patient blocks at 'Patient Name:' ---
+    patient_splits = re.split(r"(?=Patient\s+Name:)", full_text)
+    patient_blocks = [b for b in patient_splits if re.match(r"Patient\s+Name:", b.strip())]
+
+    if not patient_blocks:
+        return base
+
+    # --- Collect service line rows from tables ---
+    svc_table_rows = []
+    for t in tables:
+        if not t or len(t) < 2:
+            continue
+        for row in t:
+            if not row or not row[0]:
+                continue
+            cell0 = str(row[0]).strip()
+            # Match date pattern in first cell (e.g. "02/10/26")
+            if re.match(r"\d{2}/\d{2}/\d{2,4}", cell0):
+                svc_table_rows.append(row)
+
+    # --- Parse each patient block ---
+    records = []
+    table_idx = 0
+
+    for block in patient_blocks:
+        rec = _new_data_record()
+        rec["carrier_name"] = base["carrier_name"]
+        rec["billing_npi"] = base.get("billing_npi", "")
+        rec["payment_number"] = base.get("payment_number", "")
+        rec["payment_date"] = base.get("payment_date", "")
+        rec["pcp_number"] = base.get("pcp_number", "")
+
+        # Patient Name (strip relationship like "(self)", "(daughter)")
+        m = re.search(r"Patient\s+Name:\s*(.+?)(?:\(.*?\))?\s*$", block, re.MULTILINE)
+        if m:
+            rec["patient_name"] = m.group(1).strip().rstrip("(").strip()
+
+        # Claim ID
+        m = re.search(r"Claim\s+ID:\s*(\S+)", block)
+        if m:
+            rec["claim_number"] = m.group(1)
+
+        # Member ID
+        m = re.search(r"Member\s+ID:\s*(\S+)", block)
+        if m:
+            rec["member_id"] = m.group(1)
+
+        # Patient Account
+        m = re.search(r"Patient\s+Account:\s*(\S+)", block)
+        if m:
+            rec["patient_account"] = m.group(1)
+
+        # Date Received (Recd:)
+        m = re.search(r"Recd?:\s*(\d{2}/\d{2}/\d{2,4})", block)
+        if m:
+            rec["date_received"] = m.group(1)
+
+        # Subscriber/Member name
+        m = re.search(r"(?:^|\n)\s*Member:\s*(.+?)(?:\s*$|\s+DIAG:)", block, re.MULTILINE)
+        if m:
+            rec["subscriber_name"] = m.group(1).strip()
+
+        # Group Name
+        m = re.search(r"Group\s+Name:\s*(.+?)$", block, re.MULTILINE)
+        if m:
+            rec["servicing_prov_nm"] = m.group(1).strip()
+
+        # Product
+        m = re.search(r"Product:\s*(.+?)$", block, re.MULTILINE)
+        if m:
+            rec["product_desc"] = m.group(1).strip()
+
+        # DIAG codes
+        m = re.search(r"DIAG:\s*(.+?)$", block, re.MULTILINE)
+        if m:
+            rec["remit_detail"] = "DIAG: " + m.group(1).strip()
+
+        # Network Status
+        m = re.search(r"Network\s+Status:\s*(\S+)", block)
+        if m:
+            if not rec["remit_detail"]:
+                rec["remit_detail"] = m.group(1)
+            else:
+                rec["remit_detail"] += " | " + m.group(1)
+
+        # ISSUED AMT (the payment amount per patient)
+        m = re.search(r"ISSUED\s+AMT:\s*\$?([\d,.]+)", block)
+        if m:
+            rec["total_payable_to_provider"] = m.group(1).replace(",", "")
+        else:
+            # "NO PAY" case
+            if re.search(r"ISSUED\s+AMT:\s*NO\s*PAY", block, re.IGNORECASE):
+                rec["total_payable_to_provider"] = "0.00"
+
+        # Claim Payment (another source for paid amount)
+        m = re.search(r"Claim\s+Payment:\s*\$?([\d,.]+)", block)
+        if m:
+            paid_val = m.group(1).replace(",", "")
+            if not rec["total_payable_to_provider"]:
+                rec["total_payable_to_provider"] = paid_val
+
+        # Total Patient Responsibility
+        m = re.search(r"Total\s+Patient\s+Responsibility:\s*\$?([\d,.]+)", block)
+        if m:
+            rec["interest_amount"] = ""  # clear, not interest
+
+        # --- Service lines from tables ---
+        # Match table rows by looking for dates that fall within this block's context
+        # Use sequential matching: each patient block consumes the next available table row(s)
+        svc_date_from_block = rec.get("date_received", "")
+
+        # Try to find service line data in the text block itself
+        # Pattern: DATE PL CODE UNITS SUBMITTED NEGOTIATED COPAY ... PT_RESP PAYABLE
+        svc_line_matches = re.findall(
+            r"(\d{2}/\d{2}/\d{2,4})\s+(\d+)\s+(\d{5,7})\s+([\d.]+)\s+"
+            r"([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)",
+            block
+        )
+
+        if svc_line_matches:
+            for match in svc_line_matches:
+                svc_date, pl, code, units, billed, negotiated, copay = match
+
+                sl = {
+                    "date_of_service": svc_date,
+                    "description": code,
+                    "units": str(int(float(units))) if units else "1",
+                    "billed_amt": _clean_amount(billed),
+                    "allowed_amt": _clean_amount(negotiated),
+                    "copay_coins_amt": _clean_amount(copay),
+                    "deduct_amt": "0.00",
+                    "disallow_amt": "0.00",
+                    "cob_pmt_amt": "0.00",
+                    "withhold_amt": "0.00",
+                    "paid_to_provider_amt": rec.get("total_payable_to_provider", "0.00"),
+                    "patient_resp_amt": "0.00",
+                }
+                rec["service_lines"].append(sl)
+        elif table_idx < len(svc_table_rows):
+            # Fall back to table data
+            row = svc_table_rows[table_idx]
+            table_idx += 1
+            vals = [str(c or "0").strip() for c in row]
+
+            svc_date = vals[0] if vals else ""
+            code = vals[2] if len(vals) > 2 else ""
+            units = vals[3] if len(vals) > 3 else "1"
+            billed = vals[4] if len(vals) > 4 else "0.00"
+            negotiated = vals[5] if len(vals) > 5 else "0.00"
+            copay = vals[6] if len(vals) > 6 else "0.00"
+            # Patient resp and payable are near the end
+            payable = "0.00"
+            pt_resp = "0.00"
+            if len(vals) >= 2:
+                payable = vals[-1] if vals[-1] else "0.00"
+            if len(vals) >= 3:
+                pt_resp = vals[-2] if vals[-2] else "0.00"
+
+            sl = {
+                "date_of_service": svc_date,
+                "description": code,
+                "units": str(int(float(units))) if units and units != "0" else "1",
+                "billed_amt": _clean_amount(billed),
+                "allowed_amt": _clean_amount(negotiated),
+                "copay_coins_amt": _clean_amount(copay),
+                "deduct_amt": "0.00",
+                "disallow_amt": "0.00",
+                "cob_pmt_amt": "0.00",
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": _clean_amount(payable),
+                "patient_resp_amt": _clean_amount(pt_resp),
+            }
+            rec["service_lines"].append(sl)
+
+        # Extract patient_resp from Total Patient Responsibility if
+        # we have a service line but no pt_resp yet
+        pt_resp_match = re.search(r"Total\s+Patient\s+Responsibility:\s*\$?([\d,.]+)", block)
+        if pt_resp_match and rec["service_lines"]:
+            pt_resp_val = _clean_amount(pt_resp_match.group(1))
+            for sl in rec["service_lines"]:
+                if sl["patient_resp_amt"] == "0.00":
+                    sl["patient_resp_amt"] = pt_resp_val
+
+        # Compute derived fields
+        _compute_derived_fields(rec)
+
+        if rec["patient_name"] or rec["claim_number"]:
+            records.append(rec)
+
+    if not records:
+        return base
+
+    result = records[0]
+    if len(records) > 1:
+        result["_records"] = records
+    return result
+
+
+def _extract_aetna_claims(full_text, tables):
+    """Handle Aetna 'Summary of Claim Payment' PDFs with reversed text labels.
+
+    These PDFs have reversed labels like 'tneitaP :emaN' (Patient Name)
+    but normal values. Each patient block starts with 'tneitaP :emaN'.
+    Service line data is in extracted tables.
+    """
+    # --- Extract header info (Trace Number, carrier, etc.) ---
+    base = _new_data_record()
+    base["carrier_name"] = "Aetna"
+
+    # Prefer non-reversed TraceNumber (page 2) over reversed version
+    m = re.search(r"TraceNumber:\s*([\d]+)", full_text)
+    if m:
+        base["payment_number"] = m.group(1)
+    else:
+        m = re.search(r"Trace\s*:rebmuN\s*([\d]+)", full_text)
+        if m:
+            base["payment_number"] = m.group(1)[::-1]
+
+    m = re.search(r"Trace\s*(?::tnuomA|:Amount|Amount:?)\s*\$?([\d,.]+)", full_text)
+    if not m:
+        m = re.search(r"TraceAmount:\s*\$?([\d,.]+)", full_text)
+
+    # NPI (only match non-reversed NPI: label, not reversed :NIP which is PIN:)
+    m = re.search(r"(?<!\S)NPI:\s*([\d]+)", full_text)
+    if m:
+        base["billing_npi"] = m.group(1)
+
+    m = re.search(r"(?:detnirP|Printed):?\s*(\d{2}/\d{2}/\d{4})", full_text)
+    if m:
+        base["payment_date"] = m.group(1)
+
+    # --- Split into patient blocks ---
+    patient_splits = re.split(r"tneitaP :emaN\s+", full_text)
+    if len(patient_splits) < 2:
+        # No Aetna patient blocks found, return base with whatever we have
+        return base
+
+    # --- Collect tables with service line data (rows starting with date) ---
+    svc_tables = []
+    for t in tables:
+        for row in t:
+            if row[0] and re.match(r"\d{2}/\d{2}/\d{2}", str(row[0])):
+                svc_tables.append(row)
+                break
+
+    # --- Parse each patient block ---
+    records = []
+    for idx, block in enumerate(patient_splits[1:]):
+        rec = _new_data_record()
+        rec["carrier_name"] = base["carrier_name"]
+        rec["billing_npi"] = base.get("billing_npi", "")
+        rec["payment_number"] = base.get("payment_number", "")
+        rec["payment_date"] = base.get("payment_date", "")
+
+        # Patient name (first line of block)
+        first_line = block.split("\n")[0].strip()
+        # Remove trailing parenthetical like "(esuops)"
+        name = re.sub(r"\s*\(.*\)\s*$", "", first_line).strip()
+        rec["patient_name"] = name
+
+        # Claim ID
+        m = re.search(r"mialC ID:\s*(\S+)", block)
+        if m:
+            rec["claim_number"] = m.group(1)
+
+        # Member ID
+        m = re.search(r"rebmeM ID:\s*(\S+)", block)
+        if m:
+            rec["member_id"] = m.group(1)
+
+        # Patient Account
+        m = re.search(r"(?:tnuoccA|Account)\s+(\w+)", block)
+        if m:
+            rec["patient_account"] = m.group(1)
+
+        # Subscriber name (reversed "rebmeM" label — each word is individually reversed)
+        m = re.search(r":rebmeM\s+([A-Z][A-Z ]+?)(?:\s+DIAG:|\s*$)", block)
+        if m:
+            raw = m.group(1).strip()
+            # Each word is char-reversed individually, then words stay in order
+            rec["subscriber_name"] = " ".join(w[::-1] for w in raw.split())
+
+        # Date received (Recd date, reversed label — date digits are reversed)
+        m = re.search(r":dceR\s+(\d{2}/\d{2}/\d{2})", block)
+        if m:
+            # Reverse the date string: "62/31/20" → "02/13/26"
+            rec["date_received"] = m.group(1)[::-1]
+
+        # Product / Plan (each word is char-reversed individually)
+        m = re.search(r":tcudorP\s+(.+?)(?:\s+krowteN|\n)", block)
+        if m:
+            prod = m.group(1).strip()
+            rec["product_desc"] = " ".join(w[::-1] for w in prod.split())
+
+        # ISSUED AMT (this is the paid amount)
+        m = re.search(r"ISSUED AMT:\s*\$?([\d,.]+)", block)
+        if m:
+            rec["total_payable_to_provider"] = m.group(1).replace(",", "")
+
+        # Claim Payment (fallback for total payable)
+        if not rec["total_payable_to_provider"]:
+            m = re.search(r"Claim Payment:\s*\$?([\d,.]+)", block)
+            if m:
+                rec["total_payable_to_provider"] = m.group(1).replace(",", "")
+
+        # Build service line from matching table
+        if idx < len(svc_tables):
+            row = svc_tables[idx]
+            # Table columns: DATE, PL, CODE, UNITS, BILLED, NEGOTIATED, COPAY, ..., PT_RESP, PAYABLE
+            vals = [str(c or "0") for c in row]
+            svc_date = vals[0] if vals else ""
+            proc_code = vals[2] if len(vals) > 2 else ""
+            units = vals[3] if len(vals) > 3 else "1"
+            billed = vals[4] if len(vals) > 4 else "0.00"
+            allowed = vals[5] if len(vals) > 5 else "0.00"  # Negotiated = allowed
+            copay = vals[6] if len(vals) > 6 else "0.00"
+            # Payable amount is last non-empty value
+            payable = vals[-1] if vals else "0.00"
+            # Patient resp is second to last
+            pt_resp = vals[-2] if len(vals) >= 2 else "0.00"
+
+            try:
+                disallow = "%.2f" % (float(billed) - float(allowed))
+            except (ValueError, TypeError):
+                disallow = "0.00"
+
+            sl = {
+                "date_of_service": svc_date,
+                "description": proc_code,
+                "units": str(int(float(units))) if units else "1",
+                "billed_amt": _clean_amount(billed),
+                "disallow_amt": _clean_amount(disallow),
+                "allowed_amt": _clean_amount(allowed),
+                "deduct_amt": "0.00",
+                "copay_coins_amt": _clean_amount(copay),
+                "cob_pmt_amt": "0.00",
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": _clean_amount(payable),
+                "patient_resp_amt": _clean_amount(pt_resp),
+            }
+            rec["service_lines"].append(sl)
+        else:
+            # No matching table, try regex from text
+            m = re.search(
+                r"(\d{2}/\d{2}/\d{2})\s+\d+\s+(\d{5,7})\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)",
+                block
+            )
+            if m:
+                billed = m.group(4)
+                allowed = m.group(5)
+                try:
+                    disallow = "%.2f" % (float(billed) - float(allowed))
+                except (ValueError, TypeError):
+                    disallow = "0.00"
+                sl = {
+                    "date_of_service": m.group(1),
+                    "description": m.group(2),
+                    "units": "1",
+                    "billed_amt": _clean_amount(billed),
+                    "disallow_amt": _clean_amount(disallow),
+                    "allowed_amt": _clean_amount(allowed),
+                    "deduct_amt": "0.00",
+                    "copay_coins_amt": "0.00",
+                    "cob_pmt_amt": "0.00",
+                    "withhold_amt": "0.00",
+                    "paid_to_provider_amt": rec.get("total_payable_to_provider", "0.00"),
+                    "patient_resp_amt": "0.00",
+                }
+                rec["service_lines"].append(sl)
+
+        _compute_derived_fields(rec)
+
+        # Only add records with actual data
+        if rec["patient_name"] or rec["claim_number"]:
+            records.append(rec)
+
+    if not records:
+        return base
+
+    # Return first record as primary, all as _records
+    result = records[0]
+    if len(records) > 1:
+        result["_records"] = records
+    return result
+
+
+def _is_medicare_format(full_text):
+    """Detect if text is a Medicare Remittance Advice format."""
+    # Standard header
+    if re.search(r"MEDICARE\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE):
+        return True
+    # Fixed-width column header
+    if re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV[_ ]PD", full_text):
+        return True
+    # Spaced-out text from some PDFs: "M E D I C A R E" or "P_E_R_F_ _P_R_O_V_"
+    collapsed = full_text.replace(" ", "").replace("_", "")
+    if re.search(r"MEDICAREREMITTANCEADVICE", collapsed, re.IGNORECASE):
+        return True
+    if re.search(r"PERFPROV.*SERVDATE.*BILLED.*ALLOWED.*PROVPD", collapsed):
+        return True
+    # OCR fallback: MEDICARE keyword + NAME...MID...ICN block
+    if (re.search(r"\bMEDICARE\b", full_text, re.IGNORECASE)
+            and re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text)):
+        return True
+    # NAME...MID...ICN blocks present (even without MEDICARE keyword)
+    if re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text):
+        name_blocks = re.findall(r"^\s*NAME\s+[A-Z]", full_text, re.MULTILINE | re.IGNORECASE)
+        if len(name_blocks) >= 2:
+            return True
+    return False
+
+
 def _extract_medicare_claims(full_text, lines, data):
     """Handle Medicare Remittance Advice (fixed-width text) format.
 
@@ -710,12 +1597,7 @@ def _extract_medicare_claims(full_text, lines, data):
     claim block and builds service lines from CLAIM TOTALS rows.
     """
     # --- Detect Medicare format ---
-    is_medicare = bool(
-        re.search(r"MEDICARE\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE)
-        or re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV[_ ]PD", full_text)
-        or (re.search(r"\bMEDICARE\b", full_text, re.IGNORECASE)
-            and re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text))
-    )
+    is_medicare = _is_medicare_format(full_text)
     if not is_medicare:
         return
 
@@ -792,12 +1674,7 @@ def _extract_medicare_claims(full_text, lines, data):
 
 def _extract_medicare_records(full_text, lines, base_data):
     """Return one parsed record per Medicare claim block, if applicable."""
-    is_medicare = bool(
-        re.search(r"MEDICARE\s+REMITTANCE\s+ADVICE", full_text, re.IGNORECASE)
-        or re.search(r"PERF\s+PROV.*SERV\s+DATE.*BILLED.*ALLOWED.*PROV[_ ]PD", full_text)
-        or (re.search(r"\bMEDICARE\b", full_text, re.IGNORECASE)
-            and re.search(r"\bNAME\b.+\bMID\b.+\bICN\b", full_text))
-    )
+    is_medicare = _is_medicare_format(full_text)
     if not is_medicare:
         return [base_data]
 
@@ -884,12 +1761,11 @@ def _parse_medicare_block(block_lines, data):
     # --- Parse CLAIM TOTALS line ---
     # CLAIM TOTALS  BILLED  ALLOWED  DEDUCT  COINS  GRP/RC-AMT  PROV_PD
     claim_totals = None
+    claim_totals_amounts = []
     for line in block_lines:
-        m = re.search(
-            r"CLAIM\s+TOTALS\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)",
-            line
-        )
+        m = re.search(r"CLAIM\s+TOTALS[,]?\s+([\d.]+(?:\s+[\d.]+)*)", line)
         if m:
+            claim_totals_amounts = re.findall(r"[\d.]+", m.group(1))
             claim_totals = m
             break
 
@@ -921,12 +1797,20 @@ def _parse_medicare_block(block_lines, data):
                 units = nos
 
         # Amounts from CLAIM TOTALS (more reliable than data line)
-        if claim_totals:
-            billed = claim_totals.group(1)
-            allowed = claim_totals.group(2)
-            deduct = claim_totals.group(3)
-            coins = claim_totals.group(4)
-            prov_pd = claim_totals.group(6)
+        # Format: BILLED ALLOWED DEDUCT COINS [GRP/RC-AMT] [PROV_PD]
+        if claim_totals and len(claim_totals_amounts) >= 4:
+            billed = claim_totals_amounts[0]
+            allowed = claim_totals_amounts[1]
+            deduct = claim_totals_amounts[2]
+            coins = claim_totals_amounts[3]
+            # 6 numbers: ..., GRP/RC-AMT, PROV_PD
+            if len(claim_totals_amounts) >= 6:
+                prov_pd = claim_totals_amounts[5]
+            # 5 numbers: ..., GRP/RC-AMT (PROV_PD is 0/missing)
+            elif len(claim_totals_amounts) == 5:
+                prov_pd = "0.00"
+            else:
+                prov_pd = "0.00"
         else:
             # Fallback: try to extract amounts from the data line text
             billed = allowed = deduct = coins = prov_pd = "0.00"
