@@ -929,12 +929,29 @@ def _extract_uhc_remittance_claims(full_text):
     if m:
         base["payment_date"] = m.group(1)
 
-    # Payment number — OCR often splits label/value across lines
-    m = re.search(r"PAYMENT\s+NUMBER:\s*(\d\S+)", full_text)
-    if not m:
+    # Payment number — try all common label variants; OCR often splits label/value
+    _pn_patterns = [
+        r"CHECK\s*/\s*EFT\s*(?:NUMBER|#|NO)?\.?:\s*([\w-]+)",
+        r"PAYMENT\s+(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"CHECK\s+(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"EFT\s+(?:NUMBER|#|NO|TRACE|TRANS(?:ACTION)?)\.?:\s*([\w-]+)",
+        r"RA\s*(?:REFERENCE|REF)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"REMIT(?:TANCE)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"TRACE\s*(?:NUMBER|#):\s*([\w-]+)",
+        r"TRANSACTION\s*(?:NUMBER|#|NO|ID)\.?:\s*([\w-]+)",
+        r"VOUCHER\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"CONTROL\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+    ]
+    for _pat in _pn_patterns:
+        m = re.search(_pat, full_text, re.IGNORECASE)
+        if m:
+            base["payment_number"] = m.group(1)
+            break
+    if not base["payment_number"]:
+        # Last-resort: bare long numeric-alpha token typical of UHC payment IDs
         m = re.search(r"(\d{5}[A-Z]\d{10,})", full_text)
-    if m:
-        base["payment_number"] = m.group(1)
+        if m:
+            base["payment_number"] = m.group(1)
 
     m = re.search(r"PAYMENT\s+AMOUNT:\s*\$?([\d,.]+)", full_text)
     if not m:
@@ -1186,9 +1203,24 @@ def _extract_physicians_mutual_claims(full_text):
     if m:
         base["payment_date"] = m.group(1)
 
-    m = re.search(r"EPC\s+Draft\s*#:\s*(\S+)", full_text, re.IGNORECASE)
-    if m:
-        base["payment_number"] = m.group(1)
+    _pn_patterns = [
+        r"CHECK\s*/\s*EFT\s*(?:NUMBER|#|NO)?\.?:\s*([\w-]+)",
+        r"EPC\s+Draft\s*#:\s*(\S+)",
+        r"PAYMENT\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"CHECK\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"EFT\s*(?:NUMBER|#|NO|TRACE)?\.?:\s*([\w-]+)",
+        r"RA\s*(?:REFERENCE|REF)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"REMIT(?:TANCE)?\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"DRAFT\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"TRANSACTION\s*(?:NUMBER|#|NO|ID)\.?:\s*([\w-]+)",
+        r"VOUCHER\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+        r"CONTROL\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
+    ]
+    for _pat in _pn_patterns:
+        m = re.search(_pat, full_text, re.IGNORECASE)
+        if m:
+            base["payment_number"] = m.group(1)
+            break
 
     m = re.search(r"Tax\s+ID:\s*([\d-]+)", full_text, re.IGNORECASE)
     if m:
