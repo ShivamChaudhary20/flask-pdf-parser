@@ -926,9 +926,11 @@ def _extract_uhc_remittance_claims(full_text):
     if m:
         base["total_payable_to_provider"] = m.group(1).replace(",", "")
 
-    # --- Split at SUBSCRIBER ID: to get per-patient blocks ---
-    blocks = re.split(r"(?=SUBSCRIBER\s+ID:)", full_text)
-    subscriber_blocks = [b for b in blocks if re.match(r"SUBSCRIBER\s+ID:", b.strip())]
+    # --- Split at PATIENT: (page header) or SUBSCRIBER ID: to get per-patient blocks ---
+    # UHC format: each page starts with "PATIENT: <name>" followed by "SUBSCRIBER ID: ..."
+    # We split at PATIENT: when available, otherwise at SUBSCRIBER ID:
+    blocks = re.split(r"(?=PATIENT:\s+[A-Z]|(?<!PATIENT[^\n]{0,50})\bSUBSCRIBER\s+ID:)", full_text)
+    subscriber_blocks = [b for b in blocks if re.search(r"SUBSCRIBER\s+ID:", b)]
 
     if not subscriber_blocks:
         return base
@@ -950,8 +952,12 @@ def _extract_uhc_remittance_claims(full_text):
         if m:
             rec["subscriber_name"] = m.group(1).strip().rstrip(",")
 
-        # Patient name — in UHC remittance, subscriber IS the patient
-        rec["patient_name"] = rec["subscriber_name"]
+        # Patient name — prefer explicit PATIENT: label; fall back to subscriber name
+        m = re.search(r"PATIENT:\s*([A-Z][A-Z ,.'`-]+?)(?:\s+SUBSCRIBER\s+ID:|\s+SUBSCRIBER\s+NAME:|\s+DATE\s+RECEIVED:|\n|\s*$)", block, re.MULTILINE)
+        if m:
+            rec["patient_name"] = m.group(1).strip()
+        else:
+            rec["patient_name"] = rec["subscriber_name"]
 
         # Date Received
         m = re.search(r"DATE\s+RECEIVED:\s*([\d/]+)", block)
