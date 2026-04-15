@@ -459,9 +459,13 @@ def extract_eob_data(pdf_path):
             pdfplumber_failed = True
 
     # --- OCR fallback for image-based / scanned PDFs ---
-    text_stripped = full_text.strip()
+    # Count real words (3+ alphanumeric chars) — raw char count is unreliable
+    # because rotated-image PDFs often yield partial garbage text that exceeds 50 chars
+    # but contains no real words. Require at least 40 meaningful words before
+    # trusting pdfplumber output.
+    real_word_count = len(re.findall(r"[A-Za-z0-9]{3,}", full_text))
     used_ocr = False
-    if pdfplumber_failed or len(text_stripped) < 50:
+    if pdfplumber_failed or real_word_count < 40:
         if OCR_AVAILABLE:
             ocr_text = _ocr_pdf(pdf_path)
             if ocr_text.strip():
