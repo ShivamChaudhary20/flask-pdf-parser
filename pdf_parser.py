@@ -1218,10 +1218,11 @@ def _extract_physicians_mutual_claims(full_text):
         if m:
             rec["subscriber_name"] = m.group(1).strip()
 
-        # Policy # → subscriber_id
+        # Policy # → subscriber_id AND member_id
         m = re.search(r"Policy\s*#:\s*(\S+)", block, re.IGNORECASE)
         if m:
             rec["subscriber_id"] = m.group(1).strip()
+            rec["member_id"] = m.group(1).strip()
 
         # Patient Name
         m = re.search(r"Patient\s+Name:\s*([A-Z][A-Z .'-]+?)(?:\s{2,}|\t|Claim\s+Number|$)", block, re.MULTILINE)
