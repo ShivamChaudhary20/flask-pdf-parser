@@ -68,6 +68,7 @@ FIELD_PATTERNS = {
         r"SUBSCRIBER\s*NAME:\s*(.+?)" + _LABEL_LOOKAHEAD,
         r"INSURED\s*NAME:\s*(.+?)" + _LABEL_LOOKAHEAD,
         r"POLICY\s*HOLDER:\s*(.+?)" + _LABEL_LOOKAHEAD,
+        r"POLICYOWNER\s*NAME:\s*(.+?)" + _LABEL_LOOKAHEAD,
     ],
     "interest_amount": [
         r"INTEREST\s*(?:AMOUNT|AMT):\s*\$?([\d,.]+)",
@@ -93,7 +94,6 @@ FIELD_PATTERNS = {
         r"PCP\s*NUMBER:\s*([\d]+)",
         r"PROVIDER\s*ID:\s*([\w]+)",
         r"PROV(?:IDER)?\s*(?:NUMBER|#|NO)\.?:\s*([\w]+)",
-        r"TAX\s*ID:\s*([\d-]+)",
     ],
     "claim_number": [
         r"CLAIM\s*(?:NUMBER|#|NO)\.?:\s*([\w-]+)",
@@ -115,6 +115,7 @@ FIELD_PATTERNS = {
     ],
     "patient_account": [
         r"PATIENT\s*ACCOUNT\s*(?:NUMBER|#|NO)?\.?:\s*([\w]+)",
+        r"PATIENT\s*ACCT\s*(?:#|NUMBER|NO)?\.?:\s*([\w]+)",
         r"VENDOR\s*ID:\s*([\w]+)",
         r"ACCOUNT\s*(?:NUMBER|#|NO)\.?:\s*([\w]+)",
         r"\bACNT\s+([\w]+)",  # Medicare
