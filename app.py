@@ -315,5 +315,34 @@ def delete_record(record_id):
     return jsonify({"success": True})
 
 
+# ---------------------------------------------------------------------------
+# JSON error handlers — prevent Flask from returning HTML error pages
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": "Bad request", "detail": str(e)}), 400
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found", "detail": str(e)}), 404
+
+@app.errorhandler(413)
+def file_too_large(e):
+    return jsonify({"error": "File too large. Maximum upload size is 32 MB."}), 413
+
+@app.errorhandler(500)
+def internal_error(e):
+    db.session.rollback()
+    return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.errorhandler(Exception)
+def unhandled_exception(e):
+    db.session.rollback()
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": f"Failed to parse PDF: {str(e)}"}), 500
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
