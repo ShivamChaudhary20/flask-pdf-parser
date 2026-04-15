@@ -928,8 +928,10 @@ def _extract_uhc_remittance_claims(full_text):
 
     # --- Split at PATIENT: (page header) or SUBSCRIBER ID: to get per-patient blocks ---
     # UHC format: each page starts with "PATIENT: <name>" followed by "SUBSCRIBER ID: ..."
-    # We split at PATIENT: when available, otherwise at SUBSCRIBER ID:
-    blocks = re.split(r"(?=PATIENT:\s+[A-Z]|(?<!PATIENT[^\n]{0,50})\bSUBSCRIBER\s+ID:)", full_text)
+    if re.search(r"PATIENT:\s+[A-Z]", full_text):
+        blocks = re.split(r"(?=PATIENT:\s+[A-Z])", full_text)
+    else:
+        blocks = re.split(r"(?=SUBSCRIBER\s+ID:)", full_text)
     subscriber_blocks = [b for b in blocks if re.search(r"SUBSCRIBER\s+ID:", b)]
 
     if not subscriber_blocks:

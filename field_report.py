@@ -61,7 +61,7 @@ for pdf in pdfs:
         signal.alarm(0)
         print(f"\n{'─' * 100}")
         print(f"PDF: {pdf}")
-        print(f"  ⚠ ERROR: {e}")
+        print(f"  [ERROR]: {e}")
         print(f"{'─' * 100}")
         continue
 
@@ -70,7 +70,7 @@ for pdf in pdfs:
     print(f"PDF: {pdf}")
     used_ocr = data.get("_notice", "")
     if used_ocr:
-        print(f"  ⚠ OCR USED")
+        print(f"  [OCR USED]")
     print(f"{'─' * 100}")
 
     filled = []
@@ -84,11 +84,11 @@ for pdf in pdfs:
 
     print(f"\n  HEADER FIELDS ({len(filled)}/{len(HEADER_FIELDS)} filled):")
     for name, val in filled:
-        print(f"    ✅ {name:25s} = {val}")
+        print(f"    [OK] {name:25s} = {val}")
     if missing:
         print(f"\n  MISSING HEADER FIELDS ({len(missing)}):")
         for f in missing:
-            print(f"    ❌ {f}")
+            print(f"    [--] {f}")
             all_missing_header[f] = all_missing_header.get(f, 0) + 1
 
     lines = data.get("service_lines", [])
@@ -105,10 +105,10 @@ for pdf in pdfs:
             else:
                 line_missing.append(f)
         for name, val in line_filled:
-            print(f"      ✅ {name:20s} = {val}")
+            print(f"      [OK] {name:20s} = {val}")
         if line_missing:
             for f in line_missing:
-                print(f"      ❌ {f}")
+                print(f"      [--] {f}")
                 all_missing_line[f] = all_missing_line.get(f, 0) + 1
 
 print(f"\n\n{'=' * 100}")
