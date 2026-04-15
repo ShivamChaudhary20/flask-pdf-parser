@@ -4,6 +4,359 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EOB History - Parsed Records</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e9eff5; color: #333; font-size: 13px; }
+
+        /* ── Page wrapper ── */
+        .page-wrap { width: 100%; min-height: 100vh; }
+
+        /* ── Top bar ── */
+        .top-bar {
+            background: linear-gradient(135deg, #2b579a 0%, #3b6fa0 100%);
+            color: #fff; padding: 10px 24px;
+            display: flex; align-items: center; gap: 18px; font-size: 13px;
+        }
+        .top-bar .title { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+        .top-bar .back-btn {
+            margin-left: 20px; padding: 6px 16px; background: rgba(255,255,255,.15);
+            border-radius: 5px; color: #fff; text-decoration: none; font-size: 12px; font-weight: 500;
+            transition: background .2s;
+        }
+        .top-bar .back-btn:hover { background: rgba(255,255,255,.3); }
+
+        /* ── Toolbar ── */
+        .toolbar {
+            display: flex; align-items: center; gap: 14px;
+            padding: 14px 24px 10px; background: #f5f7fa;
+            border-bottom: 1px solid #dde4ed;
+        }
+        .toolbar input {
+            flex: 1; max-width: 500px; padding: 9px 14px; border: 1px solid #c0c8d0;
+            border-radius: 6px; font-size: 13px;
+        }
+        .toolbar input:focus { outline: none; border-color: #3b6fa0; box-shadow: 0 0 0 2px rgba(59,111,160,.15); }
+        .record-count { font-size: 12px; color: #666; margin-left: auto; font-weight: 500; }
+
+        /* ══════════════════════════════════════════════
+           CARDS — strictly ONE per row via flex column
+           ══════════════════════════════════════════════ */
+        .cards-list {
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            gap: 20px;
+            padding: 20px 24px;
+        }
+
+        .card {
+            width: 100%;
+            background: #fff;
+            border: 1px solid #d0daea;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(43,87,154,.06);
+            overflow: hidden;
+        }
+
+        /* Card header */
+        .card-hdr {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 18px;
+            background: linear-gradient(135deg, #2b579a 0%, #3b6fa0 100%);
+            color: #fff;
+        }
+        .card-hdr-left { display: flex; align-items: center; gap: 12px; }
+        .card-hdr .id-badge {
+            font-size: 11px; background: rgba(255,255,255,.2);
+            border-radius: 4px; padding: 3px 8px; font-weight: 700;
+        }
+        .card-hdr .patient-nm { font-size: 16px; font-weight: 700; letter-spacing: .3px; }
+        .card-hdr-right { display: flex; align-items: center; gap: 8px; }
+        .card-hdr .tag {
+            font-size: 10px; padding: 3px 9px; border-radius: 12px; font-weight: 700; text-transform: uppercase;
+        }
+        .tag-ocr { background: #f59e0b; color: #fff; }
+        .tag-text { background: #22c55e; color: #fff; }
+        .card-hdr .total-amt { font-size: 15px; font-weight: 800; }
+
+        /* Filename strip */
+        .card-file {
+            font-size: 11px; color: rgba(255,255,255,.75); padding: 4px 18px 6px;
+            background: rgba(0,0,0,.12); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+
+        /* Card body */
+        .card-bd { padding: 14px 18px 4px; }
+
+        /* Section titles */
+        .sec-title {
+            font-size: 11px; font-weight: 700; text-transform: uppercase;
+            color: #2b579a; letter-spacing: .05em;
+            border-bottom: 2px solid #e3edf8; padding-bottom: 4px; margin: 12px 0 8px;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .sec-title:first-child { margin-top: 0; }
+
+        /* Field grid — 4 columns on wide, auto-wrap */
+        .fields {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px 16px;
+        }
+        @media (max-width: 900px) { .fields { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 500px) { .fields { grid-template-columns: 1fr; } }
+
+        .fld label {
+            display: block; font-size: 9px; text-transform: uppercase;
+            color: #8899aa; font-weight: 700; letter-spacing: .04em; margin-bottom: 2px;
+        }
+        .fld span {
+            font-size: 12.5px; color: #1a2b45; font-weight: 500; word-break: break-word;
+        }
+        .fld span.empty { color: #ccc; font-weight: 400; }
+
+        /* Service lines table */
+        .lines-wrap { margin: 10px 0 4px; overflow-x: auto; }
+        .lines-tbl { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+        .lines-tbl thead { background: #f0f5fb; }
+        .lines-tbl th {
+            color: #2b579a; font-size: 9.5px; text-transform: uppercase; font-weight: 700;
+            padding: 6px 8px; border-bottom: 2px solid #d6e4f7; text-align: right;
+            white-space: nowrap;
+        }
+        .lines-tbl th:nth-child(-n+3) { text-align: left; }
+        .lines-tbl td { padding: 5px 8px; border-bottom: 1px solid #f0f5fb; color: #1a2b45; text-align: right; }
+        .lines-tbl td:nth-child(-n+3) { text-align: left; }
+        .lines-tbl tr:last-child td { border-bottom: none; }
+        .lines-tbl .paid-col { font-weight: 700; color: #16803c; }
+
+        /* Card footer */
+        .card-ft {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 18px; border-top: 1px solid #e8f0fb; background: #f8fbff;
+        }
+        .card-ft .ts { font-size: 11px; color: #999; display: flex; align-items: center; gap: 5px; }
+        .card-ft .actions { display: flex; gap: 8px; }
+        .btn-action {
+            padding: 6px 16px; font-size: 12px; border-radius: 5px; cursor: pointer;
+            font-weight: 600; border: 1px solid; transition: all .15s;
+        }
+        .btn-load { background: #2b579a; color: #fff; border-color: #2b579a; }
+        .btn-load:hover { background: #1e3f73; }
+        .btn-del { background: #fff; color: #e53e3e; border-color: #e53e3e; }
+        .btn-del:hover { background: #e53e3e; color: #fff; }
+
+        /* Empty state */
+        .empty-msg { text-align: center; padding: 80px 20px; color: #aaa; font-size: 15px; }
+
+        /* Pagination */
+        .pager { display: flex; gap: 4px; justify-content: center; padding: 12px 24px 24px; }
+        .pg-btn {
+            padding: 6px 14px; border: 1px solid #c0c8d0; border-radius: 4px;
+            background: #fff; cursor: pointer; font-size: 12px; font-weight: 500;
+        }
+        .pg-btn.active { background: #2b579a; color: #fff; border-color: #2b579a; }
+        .pg-btn:hover:not(.active) { background: #e3f0ff; }
+    </style>
+</head>
+<body>
+
+<div class="page-wrap">
+
+    <div class="top-bar">
+        <span class="title"><i class="fa-solid fa-clock-rotate-left"></i> EOB Parse History</span>
+        <a href="/" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Back to Form</a>
+    </div>
+
+    <div class="toolbar">
+        <input type="text" id="searchInput"
+               placeholder="Search by patient, claim #, member ID, or filename...">
+        <span class="record-count" id="recordCount"></span>
+    </div>
+
+    <div class="cards-list" id="cardsList">
+        <div class="empty-msg"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>
+    </div>
+
+    <div class="pager" id="pagination"></div>
+
+</div>
+
+<script>
+let currentPage = 1;
+let searchTimeout = null;
+
+document.getElementById('searchInput').addEventListener('input', () => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => { currentPage = 1; loadRecords(); }, 300);
+});
+
+function loadRecords() {
+    const search = document.getElementById('searchInput').value;
+    fetch(`/api/records?page=${currentPage}&per_page=10&search=${encodeURIComponent(search)}`)
+        .then(r => r.json())
+        .then(data => {
+            renderCards(data.records);
+            renderPager(data.page, data.pages, data.total);
+            document.getElementById('recordCount').textContent =
+                `${data.total} record${data.total !== 1 ? 's' : ''}`;
+        });
+}
+
+function renderCards(records) {
+    const el = document.getElementById('cardsList');
+    if (!records.length) { el.innerHTML = '<div class="empty-msg">No records found</div>'; return; }
+    el.innerHTML = records.map(r => buildCard(r)).join('');
+}
+
+/* ── Helper: display value or grey dash ── */
+function v(val) {
+    const s = esc(val);
+    return s ? `<span>${s}</span>` : `<span class="empty">&mdash;</span>`;
+}
+
+function buildCard(r) {
+    const tag = r.used_ocr
+        ? '<span class="tag tag-ocr">OCR</span>'
+        : '<span class="tag tag-text">TEXT</span>';
+
+    const totalAmt = r.total_payable_to_provider
+        ? `<span class="total-amt">$${esc(r.total_payable_to_provider)}</span>` : '';
+
+    /* ── Service lines table ── */
+    let linesHTML = '';
+    if (r.service_lines && r.service_lines.length) {
+        const rows = r.service_lines.map((sl, i) => `
+            <tr>
+                <td>${i+1}</td>
+                <td>${esc(sl.date_of_service)||'&mdash;'}</td>
+                <td>${esc(sl.description)||'&mdash;'}</td>
+                <td>${sl.units||'&mdash;'}</td>
+                <td>${sl.billed_amt||'0.00'}</td>
+                <td>${sl.disallow_amt||'0.00'}</td>
+                <td>${sl.allowed_amt||'0.00'}</td>
+                <td>${sl.deduct_amt||'0.00'}</td>
+                <td>${sl.copay_coins_amt||'0.00'}</td>
+                <td>${sl.cob_pmt_amt||'0.00'}</td>
+                <td>${sl.withhold_amt||'0.00'}</td>
+                <td class="paid-col">${sl.paid_to_provider_amt||'0.00'}</td>
+                <td>${sl.patient_resp_amt||'0.00'}</td>
+            </tr>`).join('');
+
+        linesHTML = `
+        <div class="sec-title"><i class="fa-solid fa-table-list"></i> Service Lines (${r.service_lines.length})</div>
+        <div class="lines-wrap">
+            <table class="lines-tbl">
+                <thead><tr>
+                    <th>#</th><th>Date</th><th>Code/Desc</th><th>Units</th>
+                    <th>Billed</th><th>Disallow</th><th>Allowed</th>
+                    <th>Deduct</th><th>Copay</th><th>COB</th>
+                    <th>Withhold</th><th>Paid</th><th>Pt Resp</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+    }
+
+    return `
+    <div class="card">
+        <div class="card-hdr">
+            <div class="card-hdr-left">
+                <span class="id-badge">#${r.id}</span>
+                <span class="patient-nm">${esc(r.patient_name)||'Unknown Patient'}</span>
+            </div>
+            <div class="card-hdr-right">${tag} ${totalAmt}</div>
+        </div>
+        <div class="card-file" title="${esc(r.filename)}">
+            <i class="fa-solid fa-file-pdf" style="margin-right:4px"></i>${esc(r.filename)}
+        </div>
+        <div class="card-bd">
+
+            <div class="sec-title"><i class="fa-solid fa-user"></i> Patient &amp; Claim Info</div>
+            <div class="fields">
+                <div class="fld"><label>Patient Name</label>${v(r.patient_name)}</div>
+                <div class="fld"><label>Claim #</label>${v(r.claim_number)}</div>
+                <div class="fld"><label>Member ID</label>${v(r.member_id)}</div>
+                <div class="fld"><label>Subscriber ID</label>${v(r.subscriber_id)}</div>
+                <div class="fld"><label>Subscriber Name</label>${v(r.subscriber_name)}</div>
+                <div class="fld"><label>Patient Account #</label>${v(r.patient_account)}</div>
+                <div class="fld"><label>Date Received</label>${v(r.date_received)}</div>
+                <div class="fld"><label>PCP #</label>${v(r.pcp_number)}</div>
+                <div class="fld"><label>PCP Name</label>${v(r.pcp_name)}</div>
+                <div class="fld"><label>Product Description</label>${v(r.product_desc)}</div>
+            </div>
+
+            <div class="sec-title"><i class="fa-solid fa-hospital"></i> Provider &amp; Billing</div>
+            <div class="fields">
+                <div class="fld"><label>Servicing Provider</label>${v(r.servicing_prov_nm)}</div>
+                <div class="fld"><label>Servicing NPI</label>${v(r.servicing_prov_npi)}</div>
+                <div class="fld"><label>Billing NPI</label>${v(r.billing_npi)}</div>
+                <div class="fld"><label>Carrier Name</label>${v(r.carrier_name)}</div>
+                <div class="fld"><label>Carrier ID</label>${v(r.carrier_id)}</div>
+                <div class="fld"><label>Remit Detail</label>${v(r.remit_detail)}</div>
+            </div>
+
+            <div class="sec-title"><i class="fa-solid fa-money-check-dollar"></i> Payment</div>
+            <div class="fields">
+                <div class="fld"><label>Payment Ref # (Check/EFT/RA)</label>${v(r.payment_number)}</div>
+                <div class="fld"><label>Payment Date</label>${v(r.payment_date)}</div>
+                <div class="fld"><label>Total Payable to Provider</label>${v(r.total_payable_to_provider)}</div>
+                <div class="fld"><label>Interest Amount</label>${v(r.interest_amount)}</div>
+            </div>
+
+            ${linesHTML}
+        </div>
+        <div class="card-ft">
+            <span class="ts"><i class="fa-regular fa-clock"></i> ${formatDate(r.created_at)}</span>
+            <div class="actions">
+                <button class="btn-action btn-load" onclick="loadToForm(${r.id})"><i class="fa-solid fa-upload"></i> Load</button>
+                <button class="btn-action btn-del" onclick="deleteRecord(${r.id})"><i class="fa-solid fa-trash"></i> Delete</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderPager(page, pages, total) {
+    const div = document.getElementById('pagination');
+    if (pages <= 1) { div.innerHTML = ''; return; }
+    let html = '';
+    const s = Math.max(1, page - 3), e = Math.min(pages, page + 3);
+    if (s > 1) html += `<button class="pg-btn" onclick="goPage(1)">1</button><span style="padding:0 4px">\u2026</span>`;
+    for (let i = s; i <= e; i++)
+        html += `<button class="pg-btn ${i===page?'active':''}" onclick="goPage(${i})">${i}</button>`;
+    if (e < pages) html += `<span style="padding:0 4px">\u2026</span><button class="pg-btn" onclick="goPage(${pages})">${pages}</button>`;
+    div.innerHTML = html;
+}
+
+function goPage(p) { currentPage = p; loadRecords(); window.scrollTo(0,0); }
+function loadToForm(id) { window.location.href = `/?record=${id}`; }
+function deleteRecord(id) {
+    if (!confirm('Delete this record permanently?')) return;
+    fetch(`/api/records/${id}`, { method: 'DELETE' }).then(r => r.json()).then(() => loadRecords());
+}
+function formatDate(iso) {
+    if (!iso) return '-';
+    const d = new Date(iso);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function esc(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+loadRecords();
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EOB History - Parsed Records</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ range(1000,9999)|random }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
     <style>
