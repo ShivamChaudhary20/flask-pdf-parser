@@ -22,6 +22,9 @@ eob_data.db
 *.sqlite
 *.sqlite3
 
+# Environment / secrets
+.env
+
 # OS / editor
 .DS_Store
 .vscode/
