@@ -504,6 +504,14 @@ def extract_eob_data(pdf_path):
                                  "Data was extracted using OCR — please verify accuracy.")
         return result
 
+    # ---- UHC Provider Remittance Advice (CHECK NO. format, multi-patient) ----
+    if _is_uhc_pra_check(full_text):
+        result = _extract_uhc_pra_claims(full_text)
+        if used_ocr:
+            result["_notice"] = ("This PDF is an image/scanned document. "
+                                 "Data was extracted using OCR — please verify accuracy.")
+        return result
+
     # ---- Physicians Mutual EPC remittance (multi-patient) ----
     if _is_physicians_mutual(full_text):
         return _extract_physicians_mutual_claims(full_text)
@@ -1190,6 +1198,211 @@ def _extract_uhc_remittance_claims(full_text):
     result = records[0]
     if len(records) > 1:
         result["_records"] = records
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# UHC Provider Remittance Advice — CHECK NO. format (multi-patient, text-based)
+# E.g. EFT_T7859032.pdf — splits at MEMBER lines, each with its own claim
+# ---------------------------------------------------------------------------
+
+def _is_uhc_pra_check(full_text):
+    """Detect UHC Provider Remittance Advice with CHECK NO. format."""
+    has_pra = bool(re.search(r"PROVIDER\s+REMITTANCE", full_text, re.IGNORECASE))
+    has_check = bool(re.search(r"CHECK\s+NO\.", full_text))
+    has_member = bool(re.search(r"\bMEMBER\s+[A-Z]", full_text))
+    has_claim = bool(re.search(r"CLAIM\s+NO\.", full_text))
+    return has_pra and has_check and has_member and has_claim
+
+
+def _extract_uhc_pra_claims(full_text):
+    """Extract multi-patient claims from UHC PRA (CHECK NO. format).
+
+    Format per page:
+        CHECK DATE 08/21/25 ... CHECK NO. T7859032 $20670.72
+        PROV NO. ... NAME ATHENA MEDICAL GROUP LLC ...
+        MEMBER <last>, <first> <mi>. NUMBER <id> ACCOUNT NO. <acct>
+        CLAIM NO. <claim>
+        REND PROV ID <npi>
+        PCP NAME<name> PCP NO.<number>
+        DOS PROC U CLAIMED MEM RESP DEDUCT ... AMOUNT PAID
+        07/18/25 99308 01 350.00 270.79 ...
+        CLAIM TOTAL 350.00 ...
+    """
+    # ── Global header info (from first page) ──
+    check_no_m = re.search(r"CHECK\s+NO\.\s*(?:AMOUNT\s*)?\n?\s*(?:\S+\s+){0,5}(T\d+|[A-Z0-9]+)\s+\$?([\d,.]+)", full_text)
+    if not check_no_m:
+        # Alternate: CHECK NO. on same line
+        check_no_m = re.search(r"CHECK\s+NO\.\s+(\S+)\s+.*?\$([\d,.]+)", full_text)
+
+    payment_number = ""
+    total_amount = ""
+    if check_no_m:
+        payment_number = check_no_m.group(1).strip()
+        total_amount = _clean_amount(check_no_m.group(2))
+
+    check_date_m = re.search(r"CHECK\s+DATE\s+(?:REF\s*#?\s*\d*\s*)?\n?\s*(\d{2}/\d{2}/\d{2,4})", full_text)
+    payment_date = check_date_m.group(1).strip() if check_date_m else ""
+
+    tax_id_m = re.search(r"TAX\s+ID\s+NO\.\s*(?:PAYEE\s+ID)?\s*\n?\s*(\d+)\s+(\d+)", full_text)
+    tax_id = tax_id_m.group(1).strip() if tax_id_m else ""
+    billing_npi = tax_id_m.group(2).strip() if tax_id_m else ""
+
+    # If separate PAYEE ID line pattern
+    if not billing_npi:
+        payee_id_m = re.search(r"PAYEE\s+ID\s*\n?\s*(?:\d+\s+)?(\d+)", full_text)
+        billing_npi = payee_id_m.group(1).strip() if payee_id_m else ""
+
+    # Provider name from PROV NO. ... NAME ... UPIN line
+    prov_name_m = re.search(r"PROV\s+NO\.\s+\S+\s*NAME\s+(.+?)(?:\s+UPIN)", full_text)
+    provider_name = prov_name_m.group(1).strip() if prov_name_m else ""
+
+    # ── Split into per-MEMBER claim blocks ──
+    # Each MEMBER line starts a new claim
+    blocks = re.split(r"(?=\bMEMBER\s+[A-Z])", full_text)
+    claim_blocks = [b for b in blocks if re.search(r"\bMEMBER\s+[A-Z]", b)]
+
+    if not claim_blocks:
+        # No member blocks found — return minimal data
+        data = _new_data_record()
+        data["payment_number"] = payment_number
+        data["payment_date"] = payment_date
+        data["billing_npi"] = billing_npi
+        data["carrier_name"] = "UnitedHealthcare"
+        data["total_payable_to_provider"] = total_amount
+        return data
+
+    claims = []
+    for block in claim_blocks:
+        rec = _new_data_record()
+
+        # Patient/Member name: MEMBER ANDERSON, RICK R.
+        member_m = re.search(r"MEMBER\s+([A-Z][A-Z ,.'-]+?)\s+NUMBER\s+", block)
+        if member_m:
+            raw_name = member_m.group(1).strip().rstrip(",. ")
+            rec["patient_name"] = raw_name
+            rec["subscriber_name"] = raw_name
+
+        # Member number: NUMBER 03729-908965145-00
+        number_m = re.search(r"NUMBER\s+([\w-]+)", block)
+        if number_m:
+            rec["member_id"] = number_m.group(1).strip()
+            rec["subscriber_id"] = number_m.group(1).strip()
+
+        # Account number: ACCOUNT NO. 360601360894029
+        acct_m = re.search(r"ACCOUNT\s+NO\.\s*([\w-]+)", block)
+        if acct_m:
+            rec["patient_account"] = acct_m.group(1).strip()
+
+        # Claim number: CLAIM NO. EVC 28384224-00  OR  CLAIM NO. ATL 00960794-00
+        claim_m = re.search(r"CLAIM\s+NO\.\s*(.+?)(?:\n|$)", block)
+        if claim_m:
+            rec["claim_number"] = claim_m.group(1).strip()
+
+        # Rendering provider NPI: REND PROV ID 1679876031
+        rend_m = re.search(r"REND\s+PROV\s+ID\s+(\d+)", block)
+        if rend_m:
+            rec["servicing_prov_npi"] = rend_m.group(1).strip()
+
+        # PCP name/number: PCP NAME<name> PCP NO.<number>
+        # Can be "PCP NAMEStoughton, M.D., JOHN W." or "PCP NAMEPCP Not Selected"
+        pcp_m = re.search(r"PCP\s*NAME\s*(.+?)\s*PCP\s*NO\.\s*(\S+)", block)
+        if pcp_m:
+            pcp_name = pcp_m.group(1).strip()
+            pcp_num = pcp_m.group(2).strip()
+            # Clean up "PCP Not Selected" → empty
+            if "not selected" not in pcp_name.lower():
+                rec["pcp_name"] = pcp_name
+            rec["pcp_number"] = pcp_num
+
+        # Provider name from PROV NO line within block (may differ per section)
+        block_prov_m = re.search(r"PROV\s+NO\.\s+\S+\s*NAME\s+(.+?)(?:\s+UPIN|\n)", block)
+        if block_prov_m:
+            rec["servicing_prov_nm"] = block_prov_m.group(1).strip()
+        elif provider_name:
+            rec["servicing_prov_nm"] = provider_name
+
+        # Diagnosis codes (for reference, store in remit_detail)
+        diag_m = re.search(r"DIAG\s+(.+?)(?:\n|$)", block)
+        if diag_m:
+            rec["remit_detail"] = "DIAG: " + diag_m.group(1).strip()
+
+        # Global fields
+        rec["payment_number"] = payment_number
+        rec["payment_date"] = payment_date
+        rec["billing_npi"] = billing_npi
+        rec["carrier_name"] = "UnitedHealthcare"
+        rec["carrier_id"] = tax_id
+
+        # ── Service lines: parse DOS lines and CLAIM TOTAL ──
+        # DOS line format: MM/DD/YY PROC UNITS CLAIMED MEM_RESP ... AMOUNT_PAID
+        dos_lines = re.findall(
+            r"(\d{2}/\d{2}/\d{2})\s+(\w+)\s+(\d+)\s+([\d,.]+)\s+([\d,.]+)(?:\s+(\w+))?\s+([\d,.]+)\s+([\d,.]+)",
+            block
+        )
+        claim_total_m = re.search(r"CLAIM\s+TOTAL\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)", block)
+
+        for dos_match in dos_lines:
+            dos_date = dos_match[0]
+            proc_code = dos_match[1]
+            units = dos_match[2]
+            billed = _clean_amount(dos_match[3])
+            paid = _clean_amount(dos_match[4])
+            # Remaining amounts from the line — varies by column layout
+            deduct = _clean_amount(dos_match[6]) if len(dos_match) > 6 else "0.00"
+            amt_paid = _clean_amount(dos_match[7]) if len(dos_match) > 7 else "0.00"
+
+            line = {
+                "date_of_service": dos_date,
+                "description": proc_code,
+                "units": units,
+                "billed_amt": billed,
+                "disallow_amt": "0.00",
+                "allowed_amt": "0.00",
+                "deduct_amt": deduct,
+                "copay_coins_amt": "0.00",
+                "cob_pmt_amt": "0.00",
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": amt_paid,
+                "patient_resp_amt": paid,
+            }
+            rec["service_lines"].append(line)
+
+        # If no DOS lines parsed but CLAIM TOTAL exists, create a single line
+        if not rec["service_lines"] and claim_total_m:
+            rec["service_lines"].append({
+                "date_of_service": "",
+                "description": "",
+                "units": "1",
+                "billed_amt": _clean_amount(claim_total_m.group(1)),
+                "disallow_amt": "0.00",
+                "allowed_amt": "0.00",
+                "deduct_amt": _clean_amount(claim_total_m.group(3)),
+                "copay_coins_amt": "0.00",
+                "cob_pmt_amt": "0.00",
+                "withhold_amt": "0.00",
+                "paid_to_provider_amt": _clean_amount(claim_total_m.group(4)),
+                "patient_resp_amt": _clean_amount(claim_total_m.group(2)),
+            })
+
+        claims.append(rec)
+
+    # If only one claim, return it directly; otherwise return the first with
+    # all claims accessible (the app currently shows first claim, user picks via selector)
+    if len(claims) == 1:
+        claims[0]["total_payable_to_provider"] = total_amount
+        return claims[0]
+
+    # Multi-claim: return first with _claims list for selector
+    result = claims[0]
+    result["total_payable_to_provider"] = total_amount
+    result["_claims"] = claims
+    # Set total on each claim
+    for c in claims:
+        c["carrier_name"] = "UnitedHealthcare"
+        c["payment_number"] = payment_number
+        c["payment_date"] = payment_date
     return result
 
 

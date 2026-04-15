@@ -287,6 +287,7 @@ def get_records():
                 EOBRecord.claim_number.ilike(like),
                 EOBRecord.member_id.ilike(like),
                 EOBRecord.filename.ilike(like),
+                EOBRecord.payment_number.ilike(like),
             )
         )
     query = query.order_by(EOBRecord.created_at.desc())
